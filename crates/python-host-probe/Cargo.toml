@@ -1,0 +1,22 @@
+[package]
+name = "python-host-probe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+rustls-native-certs.workspace = true
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+webpki-roots.workspace = true
+
+[lints]
+workspace = true

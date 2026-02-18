@@ -1,0 +1,72 @@
+package mcpone:python@0.1.0;
+
+/// The MCP One Python runtime world.
+///
+/// This defines the interface between the host and guest (Python WASM)
+/// for command-style execution.
+world sandbox {
+    /// TLS networking for secure encrypted connections.
+    ///
+    /// Note: plain TCP has been ported to WASI Preview2 sockets in the guest.
+    /// TLS remains on the custom host interface for now.
+    import mcpone:host-sockets/tls@0.1.0;
+
+    /// Output from executing Python code.
+    record execute-output {
+        /// Captured stdout from the Python execution.
+        stdout: string,
+        /// Captured stderr from the Python execution.
+        stderr: string,
+    }
+
+    /// Execute Python code in the sandbox.
+    ///
+    /// Returns captured stdout and stderr on success, or an error message on failure.
+    export execute: func(code: string) -> result<execute-output, string>;
+
+    /// WASI CLI command entrypoint.
+    ///
+    /// This allows the runtime to be executed as a normal WASI command
+    /// via `wasi:cli/run`, like other command-style tools.
+    ///
+    /// Current behavior supports `python -c <code>` and delegates execution
+    /// to the same runtime used by `execute`.
+    export wasi:cli/run@0.2.0;
+
+    /// Capture a snapshot of the current Python session state.
+    ///
+    /// Returns the serialized state as bytes (using pickle internally).
+    /// This captures all user-defined variables from previous execute() calls.
+    ///
+    /// The snapshot can be restored later using restore-state to continue
+    /// execution with the same variables available.
+    ///
+    /// Returns an error if serialization fails (e.g., unpicklable objects).
+    export snapshot-state: func() -> result<list<u8>, string>;
+
+    /// Restore Python session state from a previously captured snapshot.
+    ///
+    /// After restore, subsequent execute() calls will have access to all
+    /// variables that were present when the snapshot was taken.
+    ///
+    /// Returns an error if deserialization fails (e.g., corrupted data).
+    export restore-state: func(data: list<u8>) -> result<_, string>;
+
+    /// Clear all persistent state from the session.
+    ///
+    /// After clear, subsequent execute() calls will start with a fresh
+    /// namespace (no user-defined variables from previous calls).
+    export clear-state: func();
+
+    /// Finalize pre-initialization by resetting WASI state.
+    ///
+    /// This MUST be called at the end of pre-initialization, after all
+    /// imports are done but before the memory snapshot is captured.
+    /// It clears file handles from the WASI adapter and wasi-libc so they
+    /// don't get captured in the snapshot (which would cause "unknown handle
+    /// index" errors at runtime).
+    ///
+    /// This is only meant to be called during wasmtime-wizer
+    /// pre-initialization. Calling it at runtime has no useful effect.
+    export finalize-preinit: func();
+}

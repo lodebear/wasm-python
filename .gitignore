@@ -1,0 +1,23 @@
+# Build outputs
+target/
+**/target/
+.wasi-sdk/
+crates/mcpone-python-runtime/libs/decompressed/
+
+# Legacy host experiments (not part of monocp target path)
+third_party/
+
+# Local test/runtime data
+crates/mcpone-python-wasm-runtime/tests/python-stdlib/
+crates/mcpone-python-wasm-runtime/tests/site-packages/
+
+# Cargo extraction metadata
+**/.cargo-ok
+**/.cargo_vcs_info.json
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+
+# OS cruft
+**/.DS_Store

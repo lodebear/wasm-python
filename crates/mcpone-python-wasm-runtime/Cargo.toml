@@ -1,0 +1,32 @@
+[package]
+name = "mcpone-python-wasm-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "WASM guest runtime for MCP One sandbox - implements WIT exports via CPython"
+readme = "README.md"
+publish = false
+
+# Build as staticlib, then use WASI SDK clang to create .so
+# This matches how componentize-py builds their runtime
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["abi3-py312"] } #unified
+wit-dylib-ffi.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+wasmtime.workspace = true
+wasmtime-wasi.workspace = true
+wit-component.workspace = true
+wit-dylib.workspace = true
+wit-parser.workspace = true
+zstd.workspace = true
+
+[lints]
+workspace = true
