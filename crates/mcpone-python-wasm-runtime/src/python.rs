@@ -1290,14 +1290,20 @@ def _mcpone_trace_func(frame, event, arg):
 
     return _mcpone_trace_func
 
-def _mcpone_exec(code):
+def _mcpone_exec(code, filename='<user>'):
     '''Execute user code efficiently. Called once per execute().
 
     This function is pre-compiled and runs user code in an isolated namespace.
     Infrastructure variables (_mcpone_*) are not visible to user code.
+
+    `filename` controls the code object filename used for tracebacks and also
+    becomes `__file__` in the script globals when execution starts.
     '''
     global _mcpone_callback_code
     _mcpone_callback_code = 0
+
+    # Keep __file__ aligned with what was executed
+    _mcpone_user_globals['__file__'] = filename
 
     # Clear async result dicts from any previous execution (critical for preinit)
     _mcpone_async_import_results.clear()
@@ -1310,7 +1316,7 @@ def _mcpone_exec(code):
     _sys.stderr = _mcpone_stderr
 
     # Compile user code with top-level await support
-    compiled = compile(code, '<user>', 'exec', flags=_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    compiled = compile(code, filename, 'exec', flags=_ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
 
     # Enable tracing
     _sys.settrace(_mcpone_trace_func)
@@ -2627,15 +2633,26 @@ fn python_string_literal(s: &str) -> String {
 /// - `Error(message)` - Error message if execution failed
 /// - `Pending(waitable_set)` - Execution suspended, waiting for async callback
 pub fn execute_python(code: &str) -> ExecuteResult {
+    execute_python_with_filename(code, "<user>")
+}
+
+/// Execute Python code and capture stdout using a specific filename.
+///
+/// `filename` is used for compile-time metadata and for the Python
+/// `__file__` variable when `_mcpone_exec` runs.
+pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult {
     use std::ffi::CString;
 
     if !is_python_initialized() {
         return ExecuteResult::Error("Python not initialized".to_string());
     }
 
-    // Validate that code is valid UTF-8 (CString requires this)
+    // Validate that code and filename are valid UTF-8 C strings
     if CString::new(code).is_err() {
         return ExecuteResult::Error("Invalid code string: contains null bytes".to_string());
+    }
+    if CString::new(filename).is_err() {
+        return ExecuteResult::Error("Invalid filename string: contains null bytes".to_string());
     }
 
     unsafe {
@@ -2644,7 +2661,11 @@ pub fn execute_python(code: &str) -> ExecuteResult {
         // 1. All infrastructure (imports, trace func, etc.) is already set up
         // 2. We only parse/compile the user code, not 100+ lines of wrapper
         // 3. stdout/stderr capture reuses existing StringIO objects
-        let exec_call = format!("_mcpone_exec({})", python_string_literal(code));
+        let exec_call = format!(
+            "_mcpone_exec({}, {})",
+            python_string_literal(code),
+            python_string_literal(filename)
+        );
 
         let exec_code_cstr = match CString::new(exec_call) {
             Ok(s) => s,

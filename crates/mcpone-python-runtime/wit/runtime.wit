@@ -27,10 +27,13 @@ world sandbox {
     /// WASI CLI command entrypoint.
     ///
     /// This allows the runtime to be executed as a normal WASI command
-    /// via `wasi:cli/run`, like other command-style tools.
+    /// via `wasi:cli/run`.
     ///
-    /// Current behavior supports `python -c <code>` and delegates execution
-    /// to the same runtime used by `execute`.
+    /// Behaviors:
+    /// - `python -c <code>`
+    /// - `python <script.py>`
+    ///
+    /// Both paths delegate to the same runtime used by `execute`.
     export wasi:cli/run@0.2.0;
 
     /// Capture a snapshot of the current Python session state.

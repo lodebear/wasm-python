@@ -463,7 +463,6 @@ fn resolve_export_kind(func: ExportFunction) -> Option<ExportKind> {
     }
 }
 
-
 // =============================================================================
 // Invoke callback mechanism
 // =============================================================================
@@ -1824,17 +1823,44 @@ enum HandleExportResult {
     Pending(u32),
 }
 
-fn extract_code_from_python_cli_args(argv: &[String]) -> Result<String, String> {
-    if argv.len() >= 3 && argv[1] == "-c" {
-        return Ok(argv[2].clone());
+fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, String> {
+    if argv.len() == 2 && argv[1] == "-c" {
+        return Err("python wasi:cli/run requires a code string after -c".to_string());
     }
-    Err("python wasi:cli/run currently supports only `-c <code>`".to_string())
+
+    if argv.len() >= 3 && argv[1] == "-c" {
+        return Ok(CliRunInput {
+            code: argv[2].clone(),
+            filename: None,
+        });
+    }
+
+    if argv.len() >= 2 && !argv[1].starts_with('-') {
+        let path = argv[1].clone();
+        let code = std::fs::read_to_string(&path)
+            .map_err(|err| format!("Failed to read python script '{path}': {err}"))?;
+
+        return Ok(CliRunInput {
+            code,
+            filename: Some(path),
+        });
+    }
+
+    Err("python wasi:cli/run currently supports `-c <code>` or `python <script.py>`".to_string())
+}
+
+#[derive(Debug, Clone)]
+struct CliRunInput {
+    /// Python source code to execute.
+    code: String,
+    /// Optional filename for compile metadata and `__file__`.
+    filename: Option<String>,
 }
 
 fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
     let argv: Vec<String> = std::env::args().collect();
-    let code = match extract_code_from_python_cli_args(&argv) {
-        Ok(code) => code,
+    let input = match extract_code_from_python_cli_args(&argv) {
+        Ok(input) => input,
         Err(message) => {
             eprintln!("{}", message);
             cx.stack.push(Value::ResultDiscriminant(false));
@@ -1843,7 +1869,10 @@ fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
     };
 
     // Delegate to the same execution path used by the execute export.
-    let result = with_wit(wit, || python::execute_python(&code));
+    let result = with_wit(wit, || match input.filename.as_deref() {
+        Some(filename) => python::execute_python_with_filename(&input.code, filename),
+        None => python::execute_python(&input.code),
+    });
     match result {
         python::ExecuteResult::Complete(output) => {
             use std::io::Write;
