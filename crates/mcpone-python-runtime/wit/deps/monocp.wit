@@ -1,0 +1,58 @@
+package monocp:host@0.2.0;
+
+/// Host process and pipe APIs used by MCP One runtimes.
+interface monocp {
+  /// Create a new host-backed pipe.
+  record pipe-handles {
+    read: u32,
+    write: u32,
+  }
+
+  pipe-create: func() -> pipe-handles;
+  pipe-clone: func(handle: u32) -> u32;
+  pipe-read: func(handle: u32, max-len: u32) -> list<u8>;
+  pipe-write: func(handle: u32, data: list<u8>) -> u32;
+  pipe-close: func(handle: u32);
+
+  /// Return a process identifier for the current shell/runtime process.
+  process-id: func() -> u32;
+
+  /// File target for output redirections.
+  record file-write-target {
+    path: string,
+    append: bool,
+  }
+
+  /// Targets for propagating a POSIX-like fd table into a host-executed command.
+  variant fd-target {
+    inherit,
+    close,
+    pipe-read(u32),
+    pipe-write(u32),
+    file-read(string),
+    file-write(file-write-target),
+    dup(u32),
+  }
+
+  record fd-binding {
+    fd: u32,
+    target: fd-target,
+  }
+
+  /// Spawn a command on the host.
+  ///
+  /// argv[0] is the command name. Returns a child handle on success.
+  spawn-with-context: func(argv: list<string>, cwd: string, fds: list<fd-binding>) -> result<u64, string>;
+
+  /// Wait for a previously spawned child to complete.
+  wait-child: func(child-handle: u64) -> result<s32, string>;
+
+  /// Non-blocking wait: returns none if still running.
+  try-wait-child: func(child-handle: u64) -> option<s32>;
+
+  /// Hint that a child handle is no longer needed.
+  close-child: func(child-handle: u64);
+
+  /// Best-effort termination signal for a running child.
+  kill-child: func(child-handle: u64) -> result<_, string>;
+}

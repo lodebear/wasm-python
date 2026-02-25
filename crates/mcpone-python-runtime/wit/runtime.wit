@@ -11,6 +11,9 @@ world sandbox {
     /// TLS remains on the custom host interface for now.
     import mcpone:host-sockets/tls@0.1.0;
 
+    /// Host process execution APIs used for subprocess support.
+    import monocp:host/monocp@0.2.0;
+
     /// Output from executing Python code.
     record execute-output {
         /// Captured stdout from the Python execution.

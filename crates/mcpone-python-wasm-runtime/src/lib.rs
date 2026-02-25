@@ -104,6 +104,11 @@ enum Value {
     Char(char),
     String(String),
     Bytes(Vec<u8>),
+    /// Generic list argument encoding.
+    ///
+    /// Each outer vector entry is one list element.
+    /// Each inner vector contains the stack values for that element in push order.
+    ListArg(Vec<Vec<Value>>),
     /// For result<T, E>: true = ok, false = err
     ResultDiscriminant(bool),
     /// For option<T>: true = some, false = none
@@ -305,13 +310,23 @@ impl Call for McponeCall {
         match self.stack.pop() {
             Some(Value::Bytes(bytes)) => {
                 let len = bytes.len();
-                // Push bytes back for iteration
+                // Push bytes back for iteration in natural order.
                 for b in bytes.into_iter().rev() {
                     self.stack.push(Value::U8(b));
                 }
                 len
             }
-            other => panic!("expected Bytes for list, got {other:?}"),
+            Some(Value::ListArg(elements)) => {
+                let len = elements.len();
+                // Push list elements in reverse so the first element is popped first.
+                for element in elements.into_iter().rev() {
+                    for value in element {
+                        self.stack.push(value);
+                    }
+                }
+                len
+            }
+            other => panic!("expected list argument, got {other:?}"),
         }
     }
 
@@ -812,6 +827,27 @@ fn pop_result_discriminant(cx: &mut McponeCall) -> Result<bool, String> {
 fn pop_u32_value(cx: &mut McponeCall, what: &str) -> Result<u32, String> {
     match cx.stack.pop() {
         Some(Value::U32(v)) => Ok(v),
+        other => Err(format!("unexpected {what}: {other:?}")),
+    }
+}
+
+fn pop_u64_value(cx: &mut McponeCall, what: &str) -> Result<u64, String> {
+    match cx.stack.pop() {
+        Some(Value::U64(v)) => Ok(v),
+        other => Err(format!("unexpected {what}: {other:?}")),
+    }
+}
+
+fn pop_s32_value(cx: &mut McponeCall, what: &str) -> Result<i32, String> {
+    match cx.stack.pop() {
+        Some(Value::S32(v)) => Ok(v),
+        other => Err(format!("unexpected {what}: {other:?}")),
+    }
+}
+
+fn pop_string_value(cx: &mut McponeCall, what: &str) -> Result<String, String> {
+    match cx.stack.pop() {
+        Some(Value::String(v)) => Ok(v),
         other => Err(format!("unexpected {what}: {other:?}")),
     }
 }
@@ -1785,6 +1821,480 @@ pub fn do_tls_write(handle: u32, data: &[u8]) -> Result<(i32, NetResultValue), S
 /// Close a TLS connection (synchronous, no return value).
 pub fn do_tls_close(handle: u32) {
     call_tls_close(handle);
+}
+
+// =============================================================================
+// Host process execution wrappers (monocp:host/monocp@0.2.0)
+// =============================================================================
+
+const MONOCP_PROCESS_INTERFACE: &str = "monocp:host/monocp@0.2.0";
+
+#[derive(Debug, Clone)]
+enum ProcessFdTarget {
+    Inherit,
+    Close,
+    PipeRead(u32),
+    PipeWrite(u32),
+    FileRead(String),
+    FileWrite { path: String, append: bool },
+    Dup(u32),
+}
+
+#[derive(Debug, Clone)]
+struct ProcessFdBinding {
+    fd: u32,
+    target: ProcessFdTarget,
+}
+
+/// Stream handling mode used by the subprocess shim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubprocessStreamMode {
+    /// Inherit the parent stream.
+    Inherit,
+    /// Capture the stream into a buffer.
+    Pipe,
+    /// Close/null-route the stream.
+    Null,
+    /// Redirect stderr to stdout (stderr mode only).
+    Stdout,
+}
+
+impl SubprocessStreamMode {
+    fn from_u32(raw: u32) -> Option<Self> {
+        match raw {
+            0 => Some(Self::Inherit),
+            1 => Some(Self::Pipe),
+            2 => Some(Self::Null),
+            3 => Some(Self::Stdout),
+            _ => None,
+        }
+    }
+}
+
+/// Output from a host-backed subprocess execution.
+#[derive(Debug, Clone)]
+pub struct SubprocessRunOutput {
+    /// Process exit status.
+    pub returncode: i32,
+    /// Captured stdout bytes (empty when stdout is not captured).
+    pub stdout: Vec<u8>,
+    /// Captured stderr bytes (empty when stderr is not captured).
+    pub stderr: Vec<u8>,
+}
+
+#[derive(Default)]
+struct TempPathGuard {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl TempPathGuard {
+    fn push(&mut self, path: std::path::PathBuf) {
+        self.paths.push(path);
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+static NEXT_SUBPROCESS_TMP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn resolve_working_directory(cwd: Option<&str>) -> Result<String, String> {
+    let current = std::env::current_dir().map_err(|e| format!("failed to get current dir: {e}"))?;
+
+    let resolved = match cwd {
+        Some(path) if !path.is_empty() => {
+            let p = std::path::PathBuf::from(path);
+            if p.is_absolute() { p } else { current.join(p) }
+        }
+        _ => current,
+    };
+
+    Ok(resolved.to_string_lossy().into_owned())
+}
+
+fn make_temp_capture_path(base_dir: &std::path::Path, kind: &str) -> std::path::PathBuf {
+    let id = NEXT_SUBPROCESS_TMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    base_dir.join(format!(".mcpone-subprocess-{kind}-{ts}-{id}.tmp"))
+}
+
+fn can_write_temp_file_in_dir(dir: &std::path::Path) -> bool {
+    if !dir.is_dir() {
+        return false;
+    }
+
+    let probe = make_temp_capture_path(dir, "probe");
+    match std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn choose_temp_base_dir(working_dir: &str) -> Result<std::path::PathBuf, String> {
+    let mut candidates = vec![std::path::PathBuf::from(working_dir)];
+
+    if let Ok(current) = std::env::current_dir() {
+        candidates.push(current);
+    }
+
+    candidates.push(std::path::PathBuf::from("/workspace"));
+    candidates.push(std::path::PathBuf::from("/tmp"));
+
+    for candidate in candidates {
+        if can_write_temp_file_in_dir(&candidate) {
+            return Ok(candidate);
+        }
+    }
+
+    Err("could not find a writable temp directory for subprocess capture".to_string())
+}
+
+fn encode_string_list_arg(values: &[String]) -> Value {
+    Value::ListArg(
+        values
+            .iter()
+            .cloned()
+            .map(|s| vec![Value::String(s)])
+            .collect(),
+    )
+}
+
+fn encode_fd_target_values(target: &ProcessFdTarget) -> Vec<Value> {
+    match target {
+        ProcessFdTarget::Inherit => vec![Value::U32(0)],
+        ProcessFdTarget::Close => vec![Value::U32(1)],
+        ProcessFdTarget::PipeRead(handle) => vec![Value::U32(*handle), Value::U32(2)],
+        ProcessFdTarget::PipeWrite(handle) => vec![Value::U32(*handle), Value::U32(3)],
+        ProcessFdTarget::FileRead(path) => vec![Value::String(path.clone()), Value::U32(4)],
+        ProcessFdTarget::FileWrite { path, append } => {
+            vec![
+                Value::Bool(*append),
+                Value::String(path.clone()),
+                Value::U32(5),
+            ]
+        }
+        ProcessFdTarget::Dup(fd) => vec![Value::U32(*fd), Value::U32(6)],
+    }
+}
+
+fn encode_fd_bindings_arg(bindings: &[ProcessFdBinding]) -> Value {
+    let encoded = bindings
+        .iter()
+        .map(|binding| {
+            let mut values = encode_fd_target_values(&binding.target);
+            // fd-binding record { fd, target } => push target first, then fd (reverse order)
+            values.push(Value::U32(binding.fd));
+            values
+        })
+        .collect();
+    Value::ListArg(encoded)
+}
+
+fn call_process_spawn_with_context(
+    argv: &[String],
+    cwd: &str,
+    fds: &[ProcessFdBinding],
+) -> Result<Result<u64, String>, String> {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let wit = wit
+            .as_ref()
+            .ok_or_else(|| "spawn-with-context called outside of execute context".to_string())?;
+
+        let import_func = wit
+            .get_import(Some(MONOCP_PROCESS_INTERFACE), "spawn-with-context")
+            .ok_or_else(|| "monocp spawn-with-context import not found".to_string())?;
+
+        let mut cx = McponeCall::new();
+
+        // Params are (argv, cwd, fds), push in reverse order.
+        cx.stack.push(encode_fd_bindings_arg(fds));
+        cx.push_string(cwd.to_string());
+        cx.stack.push(encode_string_list_arg(argv));
+
+        import_func.call_import_sync(&mut cx);
+
+        let is_ok = pop_result_discriminant(&mut cx)?;
+        if is_ok {
+            let child = pop_u64_value(&mut cx, "spawn-with-context child-handle")?;
+            Ok(Ok(child))
+        } else {
+            let msg = pop_string_value(&mut cx, "spawn-with-context error")?;
+            Ok(Err(msg))
+        }
+    })
+}
+
+fn call_process_wait_child(child_handle: u64) -> Result<Result<i32, String>, String> {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let wit = wit
+            .as_ref()
+            .ok_or_else(|| "wait-child called outside of execute context".to_string())?;
+
+        let import_func = wit
+            .get_import(Some(MONOCP_PROCESS_INTERFACE), "wait-child")
+            .ok_or_else(|| "monocp wait-child import not found".to_string())?;
+
+        let mut cx = McponeCall::new();
+        cx.push_u64(child_handle);
+        import_func.call_import_sync(&mut cx);
+
+        let is_ok = pop_result_discriminant(&mut cx)?;
+        if is_ok {
+            let status = pop_s32_value(&mut cx, "wait-child exit status")?;
+            Ok(Ok(status))
+        } else {
+            let msg = pop_string_value(&mut cx, "wait-child error")?;
+            Ok(Err(msg))
+        }
+    })
+}
+
+fn call_process_try_wait_child(child_handle: u64) -> Result<Option<i32>, String> {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let wit = wit
+            .as_ref()
+            .ok_or_else(|| "try-wait-child called outside of execute context".to_string())?;
+
+        let import_func = wit
+            .get_import(Some(MONOCP_PROCESS_INTERFACE), "try-wait-child")
+            .ok_or_else(|| "monocp try-wait-child import not found".to_string())?;
+
+        let mut cx = McponeCall::new();
+        cx.push_u64(child_handle);
+        import_func.call_import_sync(&mut cx);
+
+        let is_some = pop_option_discriminant(&mut cx, "try-wait-child option")?;
+        if is_some {
+            let status = pop_s32_value(&mut cx, "try-wait-child exit status")?;
+            Ok(Some(status))
+        } else {
+            Ok(None)
+        }
+    })
+}
+
+fn call_process_close_child(child_handle: u64) {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let Some(wit) = wit.as_ref() else {
+            return;
+        };
+
+        let Some(import_func) = wit.get_import(Some(MONOCP_PROCESS_INTERFACE), "close-child")
+        else {
+            return;
+        };
+
+        let mut cx = McponeCall::new();
+        cx.push_u64(child_handle);
+        import_func.call_import_sync(&mut cx);
+    });
+}
+
+fn call_process_kill_child(child_handle: u64) -> Result<Result<(), String>, String> {
+    CURRENT_WIT.with(|cell| {
+        let wit = cell.borrow();
+        let wit = wit
+            .as_ref()
+            .ok_or_else(|| "kill-child called outside of execute context".to_string())?;
+
+        let import_func = wit
+            .get_import(Some(MONOCP_PROCESS_INTERFACE), "kill-child")
+            .ok_or_else(|| "monocp kill-child import not found".to_string())?;
+
+        let mut cx = McponeCall::new();
+        cx.push_u64(child_handle);
+        import_func.call_import_sync(&mut cx);
+
+        let is_ok = pop_result_discriminant(&mut cx)?;
+        if is_ok {
+            Ok(Ok(()))
+        } else {
+            let msg = pop_string_value(&mut cx, "kill-child error")?;
+            Ok(Err(msg))
+        }
+    })
+}
+
+fn read_file_or_empty(path: &std::path::Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+
+fn wait_for_child(child_handle: u64, timeout_secs: Option<f64>) -> Result<i32, String> {
+    if let Some(timeout) = timeout_secs {
+        if timeout.is_sign_negative() {
+            return Err("timeout must be >= 0".to_string());
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(timeout);
+        loop {
+            if let Some(status) = call_process_try_wait_child(child_handle)? {
+                return Ok(status);
+            }
+
+            if std::time::Instant::now() >= deadline {
+                let _ = call_process_kill_child(child_handle);
+                return Err(format!("process timed out after {timeout} seconds"));
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    match call_process_wait_child(child_handle)? {
+        Ok(status) => Ok(status),
+        Err(msg) => Err(msg),
+    }
+}
+
+/// Execute a subprocess through monocp host process APIs.
+///
+/// Stream mode mapping:
+/// - 0 = inherit
+/// - 1 = capture/pipe
+/// - 2 = null/close
+/// - 3 = stderr->stdout only (for stderr mode)
+pub fn do_subprocess_run(
+    argv: &[String],
+    cwd: Option<&str>,
+    stdin_mode_raw: u32,
+    stdout_mode_raw: u32,
+    stderr_mode_raw: u32,
+    stdin_data: Option<&[u8]>,
+    timeout_secs: Option<f64>,
+) -> Result<SubprocessRunOutput, String> {
+    if argv.is_empty() {
+        return Err("subprocess argv must not be empty".to_string());
+    }
+
+    let stdin_mode = SubprocessStreamMode::from_u32(stdin_mode_raw)
+        .ok_or_else(|| format!("invalid stdin mode: {stdin_mode_raw}"))?;
+    let stdout_mode = SubprocessStreamMode::from_u32(stdout_mode_raw)
+        .ok_or_else(|| format!("invalid stdout mode: {stdout_mode_raw}"))?;
+    let stderr_mode = SubprocessStreamMode::from_u32(stderr_mode_raw)
+        .ok_or_else(|| format!("invalid stderr mode: {stderr_mode_raw}"))?;
+
+    if matches!(stdin_mode, SubprocessStreamMode::Stdout) {
+        return Err("stdin does not support STDOUT mode".to_string());
+    }
+    if matches!(stdout_mode, SubprocessStreamMode::Stdout) {
+        return Err("stdout does not support STDOUT mode".to_string());
+    }
+    if stdin_data.is_some() && !matches!(stdin_mode, SubprocessStreamMode::Pipe) {
+        return Err("input data requires stdin=PIPE".to_string());
+    }
+
+    let working_dir = resolve_working_directory(cwd)?;
+
+    let temp_base = choose_temp_base_dir(&working_dir)?;
+    let mut temp_guard = TempPathGuard::default();
+
+    let mut stdout_capture_path: Option<std::path::PathBuf> = None;
+    let mut stderr_capture_path: Option<std::path::PathBuf> = None;
+
+    let stdin_target = match stdin_mode {
+        SubprocessStreamMode::Inherit => ProcessFdTarget::Inherit,
+        SubprocessStreamMode::Null => ProcessFdTarget::Close,
+        SubprocessStreamMode::Pipe => {
+            if let Some(data) = stdin_data {
+                let input_path = make_temp_capture_path(&temp_base, "stdin");
+                std::fs::write(&input_path, data)
+                    .map_err(|e| format!("failed to write stdin temp file: {e}"))?;
+                temp_guard.push(input_path.clone());
+                ProcessFdTarget::FileRead(input_path.to_string_lossy().into_owned())
+            } else {
+                // stdin=PIPE without explicit input: present immediate EOF
+                ProcessFdTarget::Close
+            }
+        }
+        SubprocessStreamMode::Stdout => ProcessFdTarget::Close,
+    };
+
+    let stdout_target = match stdout_mode {
+        SubprocessStreamMode::Inherit => ProcessFdTarget::Inherit,
+        SubprocessStreamMode::Null => ProcessFdTarget::Close,
+        SubprocessStreamMode::Pipe => {
+            let path = make_temp_capture_path(&temp_base, "stdout");
+            temp_guard.push(path.clone());
+            stdout_capture_path = Some(path.clone());
+            ProcessFdTarget::FileWrite {
+                path: path.to_string_lossy().into_owned(),
+                append: false,
+            }
+        }
+        SubprocessStreamMode::Stdout => ProcessFdTarget::Inherit,
+    };
+
+    let stderr_target = match stderr_mode {
+        SubprocessStreamMode::Inherit => ProcessFdTarget::Inherit,
+        SubprocessStreamMode::Null => ProcessFdTarget::Close,
+        SubprocessStreamMode::Pipe => {
+            let path = make_temp_capture_path(&temp_base, "stderr");
+            temp_guard.push(path.clone());
+            stderr_capture_path = Some(path.clone());
+            ProcessFdTarget::FileWrite {
+                path: path.to_string_lossy().into_owned(),
+                append: false,
+            }
+        }
+        SubprocessStreamMode::Stdout => ProcessFdTarget::Dup(1),
+    };
+
+    let bindings = vec![
+        ProcessFdBinding {
+            fd: 0,
+            target: stdin_target,
+        },
+        ProcessFdBinding {
+            fd: 1,
+            target: stdout_target,
+        },
+        ProcessFdBinding {
+            fd: 2,
+            target: stderr_target,
+        },
+    ];
+
+    let child_handle = match call_process_spawn_with_context(argv, &working_dir, &bindings)? {
+        Ok(handle) => handle,
+        Err(msg) => return Err(format!("spawn-with-context failed: {msg}")),
+    };
+
+    let wait_result = wait_for_child(child_handle, timeout_secs);
+    call_process_close_child(child_handle);
+
+    let returncode = wait_result?;
+
+    let stdout = stdout_capture_path
+        .as_ref()
+        .map_or_else(Vec::new, |path| read_file_or_empty(path));
+    let stderr = stderr_capture_path
+        .as_ref()
+        .map_or_else(Vec::new, |path| read_file_or_empty(path));
+
+    Ok(SubprocessRunOutput {
+        returncode,
+        stdout,
+        stderr,
+    })
 }
 
 // =============================================================================

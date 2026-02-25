@@ -517,6 +517,9 @@ fn add_sandbox_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
     // Add network stubs (TCP and TLS interfaces)
     add_network_stubs(linker)?;
 
+    // Add process stubs (monocp host process interface)
+    add_process_stubs(linker)?;
+
     Ok(())
 }
 
@@ -678,6 +681,165 @@ fn add_network_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
         |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_handle,): (u32,)| {
             // No-op - handle doesn't exist anyway
             Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
+/// pipe-handles record for monocp process stubs.
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct PreInitPipeHandles {
+    #[component(name = "read")]
+    read: u32,
+    #[component(name = "write")]
+    write: u32,
+}
+
+/// file-write-target record for monocp process stubs.
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct PreInitFileWriteTarget {
+    #[component(name = "path")]
+    path: String,
+    #[component(name = "append")]
+    append: bool,
+}
+
+/// fd-target variant for monocp process stubs.
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(variant)]
+enum PreInitFdTarget {
+    #[component(name = "inherit")]
+    Inherit,
+    #[component(name = "close")]
+    Close,
+    #[component(name = "pipe-read")]
+    PipeRead(u32),
+    #[component(name = "pipe-write")]
+    PipeWrite(u32),
+    #[component(name = "file-read")]
+    FileRead(String),
+    #[component(name = "file-write")]
+    FileWrite(PreInitFileWriteTarget),
+    #[component(name = "dup")]
+    Dup(u32),
+}
+
+/// fd-binding record for monocp process stubs.
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct PreInitFdBinding {
+    #[component(name = "fd")]
+    fd: u32,
+    #[component(name = "target")]
+    target: PreInitFdTarget,
+}
+
+/// Add stub implementations for monocp host process imports during pre-init.
+fn add_process_stubs(linker: &mut Linker<PreInitCtx>) -> Result<()> {
+    let mut process_instance = linker
+        .instance("monocp:host/monocp@0.2.0")
+        .context("Failed to get monocp:host/monocp instance")?;
+
+    process_instance.func_wrap(
+        "pipe-create",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (): ()| {
+            Ok((PreInitPipeHandles { read: 0, write: 0 },))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "pipe-clone",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_handle,): (u32,)| Ok((0_u32,)),
+    )?;
+
+    process_instance.func_wrap(
+        "pipe-read",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_handle, _max_len): (u32, u32)| {
+            Ok((Vec::<u8>::new(),))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "pipe-write",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_handle, data): (u32, Vec<u8>)| {
+            Ok((u32::try_from(data.len()).unwrap_or(u32::MAX),))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "pipe-close",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_handle,): (u32,)| Ok(()),
+    )?;
+
+    process_instance.func_wrap(
+        "process-id",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (): ()| Ok((1_u32,)),
+    )?;
+
+    process_instance.func_wrap(
+        "spawn-with-context",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>,
+         (_argv, _cwd, _fds): (Vec<String>, String, Vec<PreInitFdBinding>)| {
+            Ok((Result::<u64, String>::Err(
+                "process execution not available during pre-init".into(),
+            ),))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "wait-child",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_child_handle,): (u64,)| {
+            Ok((Result::<i32, String>::Err(
+                "process execution not available during pre-init".into(),
+            ),))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "try-wait-child",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_child_handle,): (u64,)| {
+            Ok((Option::<i32>::None,))
+        },
+    )?;
+
+    process_instance.func_wrap(
+        "close-child",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_child_handle,): (u64,)| Ok(()),
+    )?;
+
+    process_instance.func_wrap(
+        "kill-child",
+        |_ctx: wasmtime::StoreContextMut<'_, PreInitCtx>, (_child_handle,): (u64,)| {
+            Ok((Result::<(), String>::Err(
+                "process execution not available during pre-init".into(),
+            ),))
         },
     )?;
 

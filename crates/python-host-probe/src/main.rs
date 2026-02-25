@@ -356,6 +356,7 @@ async fn main() -> Result<()> {
 
     add_callback_imports(&mut linker)?;
     add_socket_imports(&mut linker)?;
+    add_process_imports(&mut linker)?;
 
     let instance = linker.instantiate_async(&mut store, &component).await?;
 
@@ -504,6 +505,152 @@ fn add_socket_imports(linker: &mut Linker<State>) -> Result<()> {
                 sockets.tls_close(handle).await;
                 Ok(())
             })
+        },
+    )?;
+
+    Ok(())
+}
+
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct ProbePipeHandles {
+    #[component(name = "read")]
+    read: u32,
+    #[component(name = "write")]
+    write: u32,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct ProbeFileWriteTarget {
+    #[component(name = "path")]
+    path: String,
+    #[component(name = "append")]
+    append: bool,
+}
+
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(variant)]
+enum ProbeFdTarget {
+    #[component(name = "inherit")]
+    Inherit,
+    #[component(name = "close")]
+    Close,
+    #[component(name = "pipe-read")]
+    PipeRead(u32),
+    #[component(name = "pipe-write")]
+    PipeWrite(u32),
+    #[component(name = "file-read")]
+    FileRead(String),
+    #[component(name = "file-write")]
+    FileWrite(ProbeFileWriteTarget),
+    #[component(name = "dup")]
+    Dup(u32),
+}
+
+#[derive(
+    Clone,
+    Debug,
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+)]
+#[component(record)]
+struct ProbeFdBinding {
+    #[component(name = "fd")]
+    fd: u32,
+    #[component(name = "target")]
+    target: ProbeFdTarget,
+}
+
+fn add_process_imports(linker: &mut Linker<State>) -> Result<()> {
+    let mut process = linker.instance("monocp:host/monocp@0.2.0")?;
+
+    process.func_wrap(
+        "pipe-create",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (): ()| {
+            Ok((ProbePipeHandles { read: 0, write: 0 },))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-clone",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_handle,): (u32,)| Ok((0_u32,)),
+    )?;
+
+    process.func_wrap(
+        "pipe-read",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_handle, _max_len): (u32, u32)| {
+            Ok((Vec::<u8>::new(),))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-write",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_handle, data): (u32, Vec<u8>)| {
+            Ok((u32::try_from(data.len()).unwrap_or(u32::MAX),))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-close",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_handle,): (u32,)| Ok(()),
+    )?;
+
+    process.func_wrap(
+        "process-id",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (): ()| Ok((1_u32,)),
+    )?;
+
+    process.func_wrap(
+        "spawn-with-context",
+        |_ctx: wasmtime::StoreContextMut<'_, State>,
+         (_argv, _cwd, _fds): (Vec<String>, String, Vec<ProbeFdBinding>)| {
+            Ok((Result::<u64, String>::Err(
+                "process execution is not implemented in python-host-probe".into(),
+            ),))
+        },
+    )?;
+
+    process.func_wrap(
+        "wait-child",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_child,): (u64,)| {
+            Ok((Result::<i32, String>::Err("invalid child handle".into()),))
+        },
+    )?;
+
+    process.func_wrap(
+        "try-wait-child",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_child,): (u64,)| Ok((Option::<i32>::None,)),
+    )?;
+
+    process.func_wrap(
+        "close-child",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_child,): (u64,)| Ok(()),
+    )?;
+
+    process.func_wrap(
+        "kill-child",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (_child,): (u64,)| {
+            Ok((Result::<(), String>::Err("invalid child handle".into()),))
         },
     )?;
 

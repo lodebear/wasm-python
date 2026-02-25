@@ -792,6 +792,48 @@ fn _mcpone_tls_close(handle: u32) {
     crate::do_tls_close(handle);
 }
 
+/// Execute a subprocess through host process APIs.
+///
+/// Python signature:
+/// _mcpone_subprocess_run(
+///     argv: list[str],
+///     cwd: str | None,
+///     stdin_mode: int,
+///     stdout_mode: int,
+///     stderr_mode: int,
+///     stdin_data: bytes | None,
+///     timeout: float | None,
+/// ) -> tuple[int, bytes, bytes]
+#[pyfunction]
+#[pyo3(signature = (argv, cwd=None, stdin_mode=0, stdout_mode=0, stderr_mode=0, stdin_data=None, timeout=None))]
+fn _mcpone_subprocess_run(
+    py: Python<'_>,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    stdin_mode: u32,
+    stdout_mode: u32,
+    stderr_mode: u32,
+    stdin_data: Option<Vec<u8>>,
+    timeout: Option<f64>,
+) -> PyResult<(i32, Py<PyAny>, Py<PyAny>)> {
+    match crate::do_subprocess_run(
+        &argv,
+        cwd.as_deref(),
+        stdin_mode,
+        stdout_mode,
+        stderr_mode,
+        stdin_data.as_deref(),
+        timeout,
+    ) {
+        Ok(output) => {
+            let stdout_obj = output.stdout.into_pyobject(py)?.into_any().unbind();
+            let stderr_obj = output.stderr.into_pyobject(py)?.into_any().unbind();
+            Ok((output.returncode, stdout_obj, stderr_obj))
+        }
+        Err(e) => Err(pyo3::exceptions::PyRuntimeError::new_err(e)),
+    }
+}
+
 /// The _mcpone module definition.
 /// This generates a `PyInit__mcpone` function that can be registered with Python.
 #[pymodule]
@@ -819,6 +861,8 @@ fn mcpone_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(_mcpone_tls_read, m)?)?;
     m.add_function(wrap_pyfunction!(_mcpone_tls_write, m)?)?;
     m.add_function(wrap_pyfunction!(_mcpone_tls_close, m)?)?;
+    // Host subprocess execution
+    m.add_function(wrap_pyfunction!(_mcpone_subprocess_run, m)?)?;
     Ok(())
 }
 
@@ -2355,6 +2399,381 @@ _sys.modules['socket'] = _socket_mcpone
 _sys.modules['_socket'] = _socket_mcpone
 "#;
 
+/// Python code to create and inject the subprocess shim module.
+///
+/// This replaces sys.modules['subprocess'] with a host-backed implementation
+/// that delegates process execution to monocp host APIs.
+pub const SUBPROCESS_SHIM_CODE: &str = r#"
+import sys as _sys
+import types as _types
+
+_subprocess_mcpone = _types.ModuleType('subprocess')
+_subprocess_mcpone.__doc__ = 'Mcpone subprocess shim - host-backed subprocess.run/Popen support.'
+
+exec(compile(r'''
+import _mcpone
+import shlex as _shlex
+
+PIPE = -1
+STDOUT = -2
+DEVNULL = -3
+
+__all__ = [
+    "Popen", "PIPE", "STDOUT", "DEVNULL", "run", "call", "check_call",
+    "check_output", "getstatusoutput", "getoutput", "CalledProcessError",
+    "SubprocessError", "TimeoutExpired", "CompletedProcess", "list2cmdline",
+]
+
+
+class SubprocessError(Exception):
+    pass
+
+
+class CalledProcessError(SubprocessError):
+    def __init__(self, returncode, cmd, output=None, stderr=None):
+        self.returncode = returncode
+        self.cmd = cmd
+        self.output = output
+        self.stderr = stderr
+
+    def __str__(self):
+        return f"Command '{self.cmd}' returned non-zero exit status {self.returncode}."
+
+    @property
+    def stdout(self):
+        return self.output
+
+    @stdout.setter
+    def stdout(self, value):
+        self.output = value
+
+
+class TimeoutExpired(SubprocessError):
+    def __init__(self, cmd, timeout, output=None, stderr=None):
+        self.cmd = cmd
+        self.timeout = timeout
+        self.output = output
+        self.stderr = stderr
+
+    def __str__(self):
+        return f"Command '{self.cmd}' timed out after {self.timeout} seconds"
+
+    @property
+    def stdout(self):
+        return self.output
+
+    @stdout.setter
+    def stdout(self, value):
+        self.output = value
+
+
+class CompletedProcess:
+    def __init__(self, args, returncode, stdout=None, stderr=None):
+        self.args = args
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+    def __repr__(self):
+        return (
+            f"CompletedProcess(args={self.args!r}, returncode={self.returncode!r}, "
+            f"stdout={self.stdout!r}, stderr={self.stderr!r})"
+        )
+
+    def check_returncode(self):
+        if self.returncode:
+            raise CalledProcessError(self.returncode, self.args, self.stdout, self.stderr)
+
+
+def list2cmdline(seq):
+    return ' '.join(_shlex.quote(str(a)) for a in seq)
+
+
+def _normalize_argv(args, shell):
+    if shell:
+        if isinstance(args, (list, tuple)):
+            command = list2cmdline(args)
+        else:
+            command = str(args)
+        return ['sh', '-c', command]
+
+    if isinstance(args, (list, tuple)):
+        return [str(a) for a in args]
+
+    return [str(args)]
+
+
+def _stdin_mode(stdin, input_data):
+    if input_data is not None:
+        return 1  # PIPE
+    if stdin is None:
+        return 0  # inherit
+    if stdin == PIPE:
+        return 1
+    if stdin == DEVNULL:
+        return 2
+    raise ValueError(f"Unsupported stdin value: {stdin!r}")
+
+
+def _stdout_mode(stdout):
+    if stdout is None:
+        return 0
+    if stdout == PIPE:
+        return 1
+    if stdout == DEVNULL:
+        return 2
+    raise ValueError(f"Unsupported stdout value: {stdout!r}")
+
+
+def _stderr_mode(stderr):
+    if stderr is None:
+        return 0
+    if stderr == PIPE:
+        return 1
+    if stderr == DEVNULL:
+        return 2
+    if stderr == STDOUT:
+        return 3
+    raise ValueError(f"Unsupported stderr value: {stderr!r}")
+
+
+def _encode_input(input_data, text_mode, encoding, errors):
+    if input_data is None:
+        return None
+
+    if isinstance(input_data, str):
+        if not text_mode:
+            raise TypeError("input must be bytes-like when text mode is disabled")
+        return input_data.encode(encoding, errors)
+
+    if isinstance(input_data, (bytes, bytearray, memoryview)):
+        return bytes(input_data)
+
+    raise TypeError("input must be str, bytes-like, or None")
+
+
+def _decode_output(data, mode, text_mode, encoding, errors):
+    if mode != 1:
+        return None
+
+    value = bytes(data)
+    if text_mode:
+        return value.decode(encoding, errors)
+    return value
+
+
+def run(
+    args,
+    *,
+    stdin=None,
+    input=None,
+    stdout=None,
+    stderr=None,
+    capture_output=False,
+    shell=False,
+    cwd=None,
+    timeout=None,
+    check=False,
+    encoding=None,
+    errors=None,
+    text=None,
+    universal_newlines=None,
+    **kwargs,
+):
+    if kwargs:
+        unsupported = ', '.join(sorted(kwargs.keys()))
+        raise TypeError(f"Unsupported subprocess options: {unsupported}")
+
+    if capture_output:
+        if stdout is not None or stderr is not None:
+            raise ValueError('stdout and stderr may not be used with capture_output')
+        stdout = PIPE
+        stderr = PIPE
+
+    if input is not None and stdin not in (None, PIPE):
+        raise ValueError('stdin and input arguments may not both be used')
+
+    text_mode = bool(text or universal_newlines or encoding or errors)
+    if text_mode and encoding is None:
+        encoding = 'utf-8'
+    if encoding is None:
+        encoding = 'utf-8'
+    if errors is None:
+        errors = 'strict'
+
+    argv = _normalize_argv(args, shell)
+    stdin_mode = _stdin_mode(stdin, input)
+    stdout_mode = _stdout_mode(stdout)
+    stderr_mode = _stderr_mode(stderr)
+    stdin_data = _encode_input(input, text_mode, encoding, errors)
+
+    try:
+        returncode, stdout_bytes, stderr_bytes = _mcpone._mcpone_subprocess_run(
+            argv,
+            cwd,
+            stdin_mode,
+            stdout_mode,
+            stderr_mode,
+            stdin_data,
+            timeout,
+        )
+    except RuntimeError as e:
+        msg = str(e)
+        if timeout is not None and 'timed out' in msg:
+            raise TimeoutExpired(args, timeout)
+        raise
+
+    stdout_value = _decode_output(stdout_bytes, stdout_mode, text_mode, encoding, errors)
+    stderr_value = (
+        None
+        if stderr_mode == 3
+        else _decode_output(stderr_bytes, stderr_mode, text_mode, encoding, errors)
+    )
+
+    completed = CompletedProcess(args, returncode, stdout_value, stderr_value)
+    if check:
+        completed.check_returncode()
+    return completed
+
+
+def call(*popenargs, timeout=None, **kwargs):
+    return run(*popenargs, timeout=timeout, **kwargs).returncode
+
+
+def check_call(*popenargs, timeout=None, **kwargs):
+    return run(*popenargs, timeout=timeout, check=True, **kwargs).returncode
+
+
+def check_output(*popenargs, timeout=None, **kwargs):
+    if 'stdout' in kwargs:
+        raise ValueError('stdout argument not allowed, it will be overridden')
+    kwargs['stdout'] = PIPE
+    kwargs['check'] = True
+    return run(*popenargs, timeout=timeout, **kwargs).stdout
+
+
+def getstatusoutput(cmd):
+    completed = run(cmd, shell=True, stdout=PIPE, stderr=STDOUT, text=True)
+    output = completed.stdout if completed.stdout is not None else ''
+    return completed.returncode, output.rstrip('\n')
+
+
+def getoutput(cmd):
+    return getstatusoutput(cmd)[1]
+
+
+class Popen:
+    def __init__(
+        self,
+        args,
+        bufsize=-1,
+        executable=None,
+        stdin=None,
+        stdout=None,
+        stderr=None,
+        preexec_fn=None,
+        close_fds=True,
+        shell=False,
+        cwd=None,
+        env=None,
+        universal_newlines=None,
+        startupinfo=None,
+        creationflags=0,
+        restore_signals=True,
+        start_new_session=False,
+        pass_fds=(),
+        *,
+        user=None,
+        group=None,
+        extra_groups=None,
+        encoding=None,
+        errors=None,
+        text=None,
+        umask=-1,
+        pipesize=-1,
+        process_group=None,
+    ):
+        if executable is not None:
+            raise NotImplementedError('executable override is not supported')
+        if preexec_fn is not None:
+            raise NotImplementedError('preexec_fn is not supported')
+        if env is not None:
+            raise NotImplementedError('custom env is not supported yet')
+        if startupinfo is not None:
+            raise NotImplementedError('startupinfo is not supported')
+        if creationflags != 0:
+            raise NotImplementedError('creationflags is not supported')
+        if user is not None or group is not None or extra_groups is not None:
+            raise NotImplementedError('user/group switching is not supported')
+        if process_group is not None and process_group != -1:
+            raise NotImplementedError('process_group is not supported')
+        if pass_fds:
+            raise NotImplementedError('pass_fds is not supported')
+        if not close_fds:
+            raise NotImplementedError('close_fds=False is not supported')
+
+        self.args = args
+        self.stdin = stdin
+        self.stdout = stdout
+        self.stderr = stderr
+        self.shell = shell
+        self.cwd = cwd
+        self.universal_newlines = universal_newlines
+        self.encoding = encoding
+        self.errors = errors
+        self.text = text
+        self.returncode = None
+        self._completed = None
+
+    def communicate(self, input=None, timeout=None):
+        if self._completed is None:
+            self._completed = run(
+                self.args,
+                stdin=self.stdin,
+                stdout=self.stdout,
+                stderr=self.stderr,
+                shell=self.shell,
+                cwd=self.cwd,
+                timeout=timeout,
+                input=input,
+                text=self.text,
+                universal_newlines=self.universal_newlines,
+                encoding=self.encoding,
+                errors=self.errors,
+            )
+            self.returncode = self._completed.returncode
+        return self._completed.stdout, self._completed.stderr
+
+    def wait(self, timeout=None):
+        if self._completed is None:
+            self.communicate(timeout=timeout)
+        return self.returncode
+
+    def poll(self):
+        return self.returncode
+
+    def kill(self):
+        raise NotImplementedError('kill() is not supported in shimmed Popen')
+
+    def terminate(self):
+        self.kill()
+
+    def send_signal(self, _sig):
+        raise NotImplementedError('send_signal() is not supported in shimmed Popen')
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.wait()
+        return False
+
+''', '<subprocess_mcpone>', 'exec'), _subprocess_mcpone.__dict__)
+
+# Register the module
+_sys.modules['subprocess'] = _subprocess_mcpone
+"#;
+
 pub fn initialize_python() {
     if PYTHON_INITIALIZED.swap(true, Ordering::SeqCst) {
         // Already initialized
@@ -2416,6 +2835,15 @@ pub fn initialize_python() {
         if result != 0 {
             // SSL shim injection failed - TLS won't work
             // Note: Can't use tracing here - this runs in WASM context
+            PyErr_Clear();
+        }
+
+        // Inject the subprocess shim module.
+        // This replaces sys.modules['subprocess'] with host-backed process execution.
+        let subprocess_cstr = std::ffi::CString::new(SUBPROCESS_SHIM_CODE).unwrap();
+        let result = PyRun_SimpleString(subprocess_cstr.as_ptr());
+        if result != 0 {
+            // Subprocess shim injection failed - subprocess.run() will not work
             PyErr_Clear();
         }
 

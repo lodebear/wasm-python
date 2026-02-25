@@ -20,8 +20,10 @@
 //! cargo test --package mcpone-python-wasm-runtime --test runtime_test
 //! ```
 
+use std::collections::HashMap;
 use std::io::Cursor;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
@@ -41,9 +43,47 @@ struct ExecuteOutput {
     stderr: String,
 }
 
+#[derive(Debug, Default)]
+struct FakeProcessTable {
+    next_child: u64,
+    children: HashMap<u64, i32>,
+    next_pipe: u32,
+    pipes: HashMap<u32, Vec<u8>>,
+}
+
+impl FakeProcessTable {
+    fn alloc_child_handle(&mut self) -> u64 {
+        let handle = if self.next_child == 0 {
+            1
+        } else {
+            self.next_child
+        };
+        self.next_child = handle.wrapping_add(1);
+        if self.next_child == 0 {
+            self.next_child = 1;
+        }
+        handle
+    }
+
+    fn alloc_pipe_handle(&mut self) -> u32 {
+        let handle = if self.next_pipe == 0 {
+            1
+        } else {
+            self.next_pipe
+        };
+        self.next_pipe = handle.wrapping_add(1);
+        if self.next_pipe == 0 {
+            self.next_pipe = 1;
+        }
+        handle
+    }
+}
+
 struct State {
     ctx: WasiCtx,
     table: ResourceTable,
+    processes: Arc<Mutex<FakeProcessTable>>,
+    workspace_host: PathBuf,
 }
 
 impl WasiView for State {
@@ -166,6 +206,7 @@ async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> 
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let site_packages_path = manifest_dir.join("tests/site-packages");
+    let workdir_path = manifest_dir.join("tests/workdir");
 
     if !stdlib_path.exists() {
         panic!(
@@ -174,8 +215,9 @@ async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> 
         );
     }
 
-    // Create site-packages if it doesn't exist
+    // Create site-packages/workdir if they don't exist
     std::fs::create_dir_all(&site_packages_path)?;
+    std::fs::create_dir_all(&workdir_path)?;
 
     // Create WASI context with preopened directories for Python
     let wasi = WasiCtxBuilder::new()
@@ -196,11 +238,20 @@ async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> 
             wasmtime_wasi::DirPerms::READ,
             wasmtime_wasi::FilePerms::READ,
         )?
+        // Writable workspace used by subprocess tests.
+        .preopened_dir(
+            &workdir_path,
+            "/workspace",
+            wasmtime_wasi::DirPerms::READ | wasmtime_wasi::DirPerms::MUTATE,
+            wasmtime_wasi::FilePerms::READ | wasmtime_wasi::FilePerms::WRITE,
+        )?
         .build();
 
     let state = State {
         ctx: wasi,
         table: ResourceTable::new(),
+        processes: Arc::new(Mutex::new(FakeProcessTable::default())),
+        workspace_host: workdir_path,
     };
 
     let mut store = Store::new(&engine, state);
@@ -359,6 +410,9 @@ async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> 
     // Add network stub implementations (TCP and TLS)
     // These return "not-permitted" errors since networking is not available in this test.
     add_network_stubs(&mut linker)?;
+
+    // Add process stub implementations for subprocess tests.
+    add_process_stubs(&mut linker)?;
 
     println!("Instantiating component...");
     let instance = linker.instantiate_async(&mut store, &component).await?;
@@ -851,6 +905,117 @@ print("to stderr", file=sys.stderr)
         }
     }
 
+    // Test 18: subprocess.run capture_output + text mode
+    println!("Test 18: subprocess.run(capture_output=True, text=True)...");
+    let (result,) = execute
+        .call_async(
+            &mut store,
+            (r#"
+import subprocess
+WORKDIR = "/workspace"
+res = subprocess.run(["mcpone-test-echo", "hello", "world"], capture_output=True, text=True, cwd=WORKDIR)
+print(f"rc={res.returncode}")
+print(f"stdout={res.stdout.strip()}")
+print(f"stderr={res.stderr!r}")
+"#
+            .to_string(),),
+        )
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            println!("  OK: {output:?}");
+            assert!(
+                output.stdout.contains("rc=0"),
+                "subprocess rc should be 0: {output:?}"
+            );
+            assert!(
+                output.stdout.contains("stdout=hello world"),
+                "subprocess stdout should be captured: {output:?}"
+            );
+            assert!(
+                output.stdout.contains("stderr=''"),
+                "subprocess stderr should be empty string: {output:?}"
+            );
+        }
+        Err(error) => {
+            panic!("Test 18 failed: {error}");
+        }
+    }
+
+    // Test 19: subprocess.run with stdin input and check_output/check=True behavior
+    println!("Test 19: subprocess input + check=True behavior...");
+    let (result,) = execute
+        .call_async(
+            &mut store,
+            (r#"
+import subprocess
+WORKDIR = "/workspace"
+cat = subprocess.run(["mcpone-test-cat"], input="abc123", text=True, capture_output=True, cwd=WORKDIR)
+print(f"cat={cat.stdout}")
+try:
+    subprocess.run(["mcpone-test-fail", "7"], check=True, capture_output=True, text=True, cwd=WORKDIR)
+    print("check_failed=False")
+except subprocess.CalledProcessError as e:
+    print(f"check_failed=True rc={e.returncode}")
+"#
+            .to_string(),),
+        )
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            println!("  OK: {output:?}");
+            assert!(
+                output.stdout.contains("cat=abc123"),
+                "stdin input should be passed to child: {output:?}"
+            );
+            assert!(
+                output.stdout.contains("check_failed=True rc=7"),
+                "check=True should raise CalledProcessError: {output:?}"
+            );
+        }
+        Err(error) => {
+            panic!("Test 19 failed: {error}");
+        }
+    }
+
+    // Test 20: stderr=STDOUT merge behavior
+    println!("Test 20: subprocess stderr=STDOUT merge...");
+    let (result,) = execute
+        .call_async(
+            &mut store,
+            (r#"
+import subprocess
+WORKDIR = "/workspace"
+res = subprocess.run(["mcpone-test-stderr"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=WORKDIR)
+print(f"merged={res.stdout.strip()}")
+print(f"stderr_is_none={res.stderr is None}")
+"#
+            .to_string(),),
+        )
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            println!("  OK: {output:?}");
+            assert!(
+                output.stdout.contains("merged=from-stderr"),
+                "stderr should be merged into stdout: {output:?}"
+            );
+            assert!(
+                output.stdout.contains("stderr_is_none=True"),
+                "stderr should be None when redirected to STDOUT: {output:?}"
+            );
+        }
+        Err(error) => {
+            panic!("Test 20 failed: {error}");
+        }
+    }
+
     println!("\nAll tests passed!");
     Ok(())
 }
@@ -984,6 +1149,322 @@ fn add_network_stubs(linker: &mut Linker<State>) -> Result<(), Box<dyn std::erro
     tls.func_wrap(
         "close",
         |_ctx: wasmtime::StoreContextMut<'_, State>, (_handle,): (u32,)| Ok(()),
+    )?;
+
+    Ok(())
+}
+
+#[derive(
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+    Clone,
+    Debug,
+)]
+#[component(record)]
+struct PipeHandles {
+    #[component(name = "read")]
+    read: u32,
+    #[component(name = "write")]
+    write: u32,
+}
+
+#[derive(
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+    Clone,
+    Debug,
+)]
+#[component(record)]
+struct FileWriteTarget {
+    #[component(name = "path")]
+    path: String,
+    #[component(name = "append")]
+    append: bool,
+}
+
+#[derive(
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+    Clone,
+    Debug,
+)]
+#[component(variant)]
+enum FdTarget {
+    #[component(name = "inherit")]
+    Inherit,
+    #[component(name = "close")]
+    Close,
+    #[component(name = "pipe-read")]
+    PipeRead(u32),
+    #[component(name = "pipe-write")]
+    PipeWrite(u32),
+    #[component(name = "file-read")]
+    FileRead(String),
+    #[component(name = "file-write")]
+    FileWrite(FileWriteTarget),
+    #[component(name = "dup")]
+    Dup(u32),
+}
+
+#[derive(
+    wasmtime::component::ComponentType,
+    wasmtime::component::Lift,
+    wasmtime::component::Lower,
+    Clone,
+    Debug,
+)]
+#[component(record)]
+struct FdBinding {
+    #[component(name = "fd")]
+    fd: u32,
+    #[component(name = "target")]
+    target: FdTarget,
+}
+
+fn resolve_child_path(cwd: &str, path: &str, workspace_host: &Path) -> PathBuf {
+    let p = Path::new(path);
+    let guest_path = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        Path::new(cwd).join(p)
+    };
+
+    if let Ok(stripped) = guest_path.strip_prefix("/workspace") {
+        if stripped.as_os_str().is_empty() {
+            workspace_host.to_path_buf()
+        } else {
+            workspace_host.join(stripped)
+        }
+    } else {
+        guest_path
+    }
+}
+
+fn write_to_target(
+    target: &FdTarget,
+    cwd: &str,
+    workspace_host: &Path,
+    data: &[u8],
+) -> Result<(), String> {
+    match target {
+        FdTarget::Inherit | FdTarget::Close | FdTarget::PipeRead(_) | FdTarget::PipeWrite(_) => {
+            Ok(())
+        }
+        FdTarget::Dup(_) => Ok(()),
+        FdTarget::FileRead(_) => Ok(()),
+        FdTarget::FileWrite(file_target) => {
+            let path = resolve_child_path(cwd, &file_target.path, workspace_host);
+            let mut opts = std::fs::OpenOptions::new();
+            opts.create(true).write(true);
+            if file_target.append {
+                opts.append(true);
+            } else {
+                opts.truncate(true);
+            }
+            let mut file = opts
+                .open(&path)
+                .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            std::io::Write::write_all(&mut file, data)
+                .map_err(|e| format!("failed to write {}: {e}", path.display()))?;
+            Ok(())
+        }
+    }
+}
+
+fn read_stdin_from_target(
+    target: &FdTarget,
+    cwd: &str,
+    workspace_host: &Path,
+) -> Result<Vec<u8>, String> {
+    match target {
+        FdTarget::FileRead(path) => {
+            let resolved = resolve_child_path(cwd, path, workspace_host);
+            std::fs::read(&resolved)
+                .map_err(|e| format!("failed to read {}: {e}", resolved.display()))
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn fd_target_for<'a>(bindings: &'a [FdBinding], fd: u32) -> Option<&'a FdTarget> {
+    bindings.iter().find(|b| b.fd == fd).map(|b| &b.target)
+}
+
+fn simulate_test_command(
+    argv: &[String],
+    cwd: &str,
+    workspace_host: &Path,
+    bindings: &[FdBinding],
+) -> Result<i32, String> {
+    let cmd = argv
+        .first()
+        .map(String::as_str)
+        .ok_or_else(|| "missing argv[0]".to_string())?;
+
+    let mut stdout_data = Vec::new();
+    let mut stderr_data = Vec::new();
+    let mut exit_code = 0_i32;
+
+    match cmd {
+        "mcpone-test-echo" => {
+            stdout_data = format!("{}\n", argv[1..].join(" ")).into_bytes();
+        }
+        "mcpone-test-cat" => {
+            let stdin_target = fd_target_for(bindings, 0).unwrap_or(&FdTarget::Inherit);
+            stdout_data = read_stdin_from_target(stdin_target, cwd, workspace_host)?;
+        }
+        "mcpone-test-stderr" => {
+            stderr_data = b"from-stderr\n".to_vec();
+        }
+        "mcpone-test-fail" => {
+            exit_code = argv.get(1).and_then(|s| s.parse::<i32>().ok()).unwrap_or(1);
+            stderr_data = format!("failed with {exit_code}\n").into_bytes();
+        }
+        _ => {
+            return Err(format!("unknown test command: {cmd}"));
+        }
+    }
+
+    let stdout_target = fd_target_for(bindings, 1).unwrap_or(&FdTarget::Inherit);
+    let stderr_target = fd_target_for(bindings, 2).unwrap_or(&FdTarget::Inherit);
+
+    if let FdTarget::Dup(target_fd) = stderr_target {
+        if *target_fd == 1 {
+            stdout_data.extend_from_slice(&stderr_data);
+            stderr_data.clear();
+        }
+    }
+
+    write_to_target(stdout_target, cwd, workspace_host, &stdout_data)?;
+    write_to_target(stderr_target, cwd, workspace_host, &stderr_data)?;
+
+    Ok(exit_code)
+}
+
+fn add_process_stubs(linker: &mut Linker<State>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut process = linker.instance("monocp:host/monocp@0.2.0")?;
+
+    process.func_wrap(
+        "pipe-create",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (): ()| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            let read = state.alloc_pipe_handle();
+            let write = state.alloc_pipe_handle();
+            state.pipes.insert(read, Vec::new());
+            state.pipes.insert(write, Vec::new());
+            Ok((PipeHandles { read, write },))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-clone",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (handle,): (u32,)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            let cloned = state.alloc_pipe_handle();
+            let data = state.pipes.get(&handle).cloned().unwrap_or_default();
+            state.pipes.insert(cloned, data);
+            Ok((cloned,))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-read",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (handle, max_len): (u32, u32)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            let data = state.pipes.entry(handle).or_default();
+            let n = usize::min(max_len as usize, data.len());
+            let out = data.drain(..n).collect::<Vec<u8>>();
+            Ok((out,))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-write",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (handle, data): (u32, Vec<u8>)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            state
+                .pipes
+                .entry(handle)
+                .or_default()
+                .extend_from_slice(&data);
+            Ok((u32::try_from(data.len()).unwrap_or(u32::MAX),))
+        },
+    )?;
+
+    process.func_wrap(
+        "pipe-close",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (handle,): (u32,)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            state.pipes.remove(&handle);
+            Ok(())
+        },
+    )?;
+
+    process.func_wrap(
+        "process-id",
+        |_ctx: wasmtime::StoreContextMut<'_, State>, (): ()| Ok((12345_u32,)),
+    )?;
+
+    process.func_wrap(
+        "spawn-with-context",
+        |ctx: wasmtime::StoreContextMut<'_, State>,
+         (argv, cwd, fds): (Vec<String>, String, Vec<FdBinding>)| {
+            let workspace = ctx.data().workspace_host.clone();
+            let exit_code = match simulate_test_command(&argv, &cwd, workspace.as_path(), &fds) {
+                Ok(code) => code,
+                Err(msg) => return Ok((Result::<u64, String>::Err(msg),)),
+            };
+
+            let mut state = ctx.data().processes.lock().unwrap();
+            let handle = state.alloc_child_handle();
+            state.children.insert(handle, exit_code);
+            Ok((Result::<u64, String>::Ok(handle),))
+        },
+    )?;
+
+    process.func_wrap(
+        "wait-child",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (child_handle,): (u64,)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            let result = match state.children.remove(&child_handle) {
+                Some(code) => Result::<i32, String>::Ok(code),
+                None => Result::<i32, String>::Err("invalid child handle".into()),
+            };
+            Ok((result,))
+        },
+    )?;
+
+    process.func_wrap(
+        "try-wait-child",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (child_handle,): (u64,)| {
+            let state = ctx.data().processes.lock().unwrap();
+            Ok((state.children.get(&child_handle).copied(),))
+        },
+    )?;
+
+    process.func_wrap(
+        "close-child",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (child_handle,): (u64,)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            state.children.remove(&child_handle);
+            Ok(())
+        },
+    )?;
+
+    process.func_wrap(
+        "kill-child",
+        |ctx: wasmtime::StoreContextMut<'_, State>, (child_handle,): (u64,)| {
+            let mut state = ctx.data().processes.lock().unwrap();
+            let result = if state.children.remove(&child_handle).is_some() {
+                Result::<(), String>::Ok(())
+            } else {
+                Result::<(), String>::Err("invalid child handle".into())
+            };
+            Ok((result,))
+        },
     )?;
 
     Ok(())
