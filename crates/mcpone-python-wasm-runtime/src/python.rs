@@ -1297,6 +1297,9 @@ import json as _json
 # Callback code storage
 _mcpone_callback_code = 0
 
+# Last SystemExit status captured from user code (None if no sys.exit was called)
+_mcpone_system_exit_code = None
+
 def _mcpone_run_async(coro):
     '''Run a coroutine using _mcpone_async runtime.'''
     global _mcpone_callback_code
@@ -1343,8 +1346,9 @@ def _mcpone_exec(code, filename='<user>'):
     `filename` controls the code object filename used for tracebacks and also
     becomes `__file__` in the script globals when execution starts.
     '''
-    global _mcpone_callback_code
+    global _mcpone_callback_code, _mcpone_system_exit_code
     _mcpone_callback_code = 0
+    _mcpone_system_exit_code = None
 
     # Keep __file__ aligned with what was executed
     _mcpone_user_globals['__file__'] = filename
@@ -1374,6 +1378,22 @@ def _mcpone_exec(code, filename='<user>'):
         else:
             # Regular synchronous code - execute in user namespace
             exec(compiled, _mcpone_user_globals, _mcpone_user_globals)
+    except SystemExit as _mcpone_exc:
+        # PyRun_SimpleString calls PyErr_PrintEx for uncaught exceptions.
+        # If that exception is SystemExit, CPython calls Py_Exit(), which
+        # finalizes the interpreter and traps inside our WASM embedding.
+        # Capture sys.exit(...) here so it never escapes to PyRun_SimpleString.
+        _mcpone_code = _mcpone_exc.code
+        if _mcpone_code is None:
+            _mcpone_system_exit_code = 0
+        elif isinstance(_mcpone_code, int):
+            _mcpone_system_exit_code = _mcpone_code
+        else:
+            # Match CPython CLI behavior: non-int payload prints to stderr,
+            # and process exits with status 1.
+            _mcpone_system_exit_code = 1
+            if _mcpone_code is not None:
+                print(_mcpone_code, file=_sys.stderr)
     finally:
         _sys.settrace(None)
 
@@ -3136,11 +3156,33 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
 
         let stdout = get_python_variable_string("_mcpone_output").unwrap_or_default();
         let stderr = get_python_variable_string("_mcpone_errors").unwrap_or_default();
+        let stdout = stdout.trim_end_matches('\n').to_string();
+        let stderr = stderr.trim_end_matches('\n').to_string();
 
-        ExecuteResult::Complete(ExecuteOutput {
-            stdout: stdout.trim_end_matches('\n').to_string(),
-            stderr: stderr.trim_end_matches('\n').to_string(),
-        })
+        // _mcpone_exec catches SystemExit to prevent PyRun_SimpleString from
+        // calling Py_Exit(). Translate non-zero exits into ExecuteResult::Error
+        // so wasi:cli/run reports failure while sys.exit(0) remains success.
+        let system_exit_code = get_python_variable_string("_mcpone_system_exit_code")
+            .ok()
+            .and_then(|value| {
+                if value == "None" {
+                    None
+                } else {
+                    value.parse::<i32>().ok()
+                }
+            })
+            .unwrap_or(0);
+
+        if system_exit_code != 0 {
+            let error = if stderr.is_empty() {
+                format!("SystemExit: {system_exit_code}")
+            } else {
+                format!("{stderr}\nSystemExit: {system_exit_code}")
+            };
+            return ExecuteResult::Error(error);
+        }
+
+        ExecuteResult::Complete(ExecuteOutput { stdout, stderr })
     }
 }
 

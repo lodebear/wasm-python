@@ -677,8 +677,61 @@ print("subprocess-ok")
                 "stderr should be empty for subprocess shim test: {:?}",
                 output
             );
-            Ok(())
         }
-        Err(err) => Err(format!("execute failed: {err}").into()),
+        Err(err) => return Err(format!("execute failed: {err}").into()),
     }
+
+    // Regression test: sys.exit() must not unwind through PyRun_SimpleString,
+    // otherwise CPython calls Py_Exit() and traps in WASM finalization.
+    let sys_exit_zero = r#"
+import sys
+print("before-exit")
+sys.exit(0)
+print("after-exit")
+"#;
+
+    let (result,) = execute
+        .call_async(&mut store, (sys_exit_zero.to_string(),))
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match result {
+        Ok(output) => {
+            assert!(
+                output.stdout.contains("before-exit"),
+                "stdout should include output produced before sys.exit(0): {:?}",
+                output
+            );
+            assert!(
+                !output.stdout.contains("after-exit"),
+                "execution must stop at sys.exit(0): {:?}",
+                output
+            );
+        }
+        Err(err) => return Err(format!("sys.exit(0) should succeed, got: {err}").into()),
+    }
+
+    let sys_exit_nonzero = "import sys\nsys.exit(7)";
+    let (result,) = execute
+        .call_async(&mut store, (sys_exit_nonzero.to_string(),))
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match result {
+        Ok(output) => {
+            return Err(format!(
+                "sys.exit(7) should fail execute(), but got successful output: {:?}",
+                output
+            )
+            .into());
+        }
+        Err(err) => {
+            assert!(
+                err.contains("SystemExit: 7"),
+                "non-zero sys.exit should surface as SystemExit error: {err}"
+            );
+        }
+    }
+
+    Ok(())
 }
