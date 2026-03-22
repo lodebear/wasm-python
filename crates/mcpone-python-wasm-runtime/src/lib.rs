@@ -2356,7 +2356,23 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         });
     }
 
-    Err("python wasi:cli/run currently supports `-c <code>` or `python <script.py>`".to_string())
+    // No -c and no script file: read code from stdin (like `echo "print(1)" | python`).
+    if argv.len() == 1 {
+        use std::io::Read;
+        let mut code = String::new();
+        std::io::stdin()
+            .read_to_string(&mut code)
+            .map_err(|err| format!("Failed to read Python code from stdin: {err}"))?;
+        if code.trim().is_empty() {
+            return Err("no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string());
+        }
+        return Ok(CliRunInput {
+            code,
+            filename: Some("<stdin>".to_string()),
+        });
+    }
+
+    Err("python wasi:cli/run currently supports `-c <code>`, `python <script.py>`, or piped stdin".to_string())
 }
 
 #[derive(Debug, Clone)]
