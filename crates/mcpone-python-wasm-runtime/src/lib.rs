@@ -2356,8 +2356,10 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         });
     }
 
-    // No -c and no script file: read code from stdin (like `echo "print(1)" | python`).
-    if argv.len() == 1 {
+    // No -c and no script file: read code from stdin.
+    // Handles both bare `python` and `python -` (explicit stdin marker, used
+    // by shells with heredocs like `python - <<'PY' ... PY`).
+    if argv.len() == 1 || (argv.len() >= 2 && argv[1] == "-") {
         use std::io::Read;
         let mut code = String::new();
         std::io::stdin()
