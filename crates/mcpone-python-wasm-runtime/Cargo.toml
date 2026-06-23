@@ -15,6 +15,19 @@ publish = false
 [lib]
 crate-type = ["staticlib"]
 
+[features]
+default = []
+# `core-net`: bind networking/TLS to PLAIN CORE imports in module "monocp"
+# (wasi_snapshot_preview1 + monocp.tcp_*/dns_*/tls_*) instead of the wit-dylib
+# component interfaces. Required for the THREADED preview1 CPython core module,
+# which has no wit-dylib bindings. See src/core_net.rs.
+core-net = []
+# `threads-command`: emit a C `main()`-callable entry (mcpone_threads_main) that
+# initializes the Python interpreter (registering the _mcpone builtins + socket/
+# ssl shims) and runs a script, so the threaded core module is a runnable
+# command. Implies core-net.
+threads-command = ["core-net"]
+
 [dependencies]
 pyo3 = { workspace = true, features = ["abi3-py312"] } #unified
 wit-dylib-ffi.workspace = true

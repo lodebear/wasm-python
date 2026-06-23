@@ -26,6 +26,15 @@
 
 pub mod python;
 
+// Plain-core-import networking for the THREADED preview1 CPython core module.
+// When `core-net` is enabled the private call_tcp_*/call_dns/call_tls_* layer
+// below delegates to this module instead of the wit-dylib component path.
+#[cfg(feature = "core-net")]
+pub mod core_net;
+
+#[cfg(feature = "threads-command")]
+pub mod threads_command;
+
 use std::alloc::Layout;
 use wit_dylib_ffi::{
     Call, Enum, ExportFunction, Flags, Future, Interpreter, List, Record, Resource, Stream, Tuple,
@@ -1241,6 +1250,7 @@ fn wasi_ip_family_discriminant(addr: WasiIpAddress) -> u32 {
 ///
 /// This uses WASI Preview2 sockets and stores stream resources in a local
 /// handle table exposed as u32 handles to Python.
+#[cfg(not(feature = "core-net"))]
 fn call_tcp_connect(host: &str, port: u16) -> Result<NetResult<u32>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1338,6 +1348,7 @@ fn call_tcp_connect(host: &str, port: u16) -> Result<NetResult<u32>, String> {
 }
 
 /// Call the TCP read import (synchronous - blocks until complete).
+#[cfg(not(feature = "core-net"))]
 fn call_tcp_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1388,6 +1399,7 @@ fn call_tcp_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
 }
 
 /// Call the TCP write import (synchronous - blocks until complete).
+#[cfg(not(feature = "core-net"))]
 fn call_tcp_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1437,6 +1449,7 @@ fn call_tcp_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
 }
 
 /// Call the TCP close import (synchronous).
+#[cfg(not(feature = "core-net"))]
 fn call_tcp_close(handle: u32) {
     let Some(conn) = wasi_tcp_remove(handle) else {
         return;
@@ -1485,6 +1498,7 @@ fn tcp_error_name(discr: u32) -> &'static str {
 // -----------------------------------------------------------------------------
 
 /// Call the TLS upgrade import (synchronous - blocks until complete).
+#[cfg(not(feature = "core-net"))]
 fn call_tls_upgrade(tcp_handle: u32, hostname: &str) -> Result<NetResult<u32>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1533,6 +1547,7 @@ fn call_tls_upgrade(tcp_handle: u32, hostname: &str) -> Result<NetResult<u32>, S
 }
 
 /// Call the TLS read import (synchronous - blocks until complete).
+#[cfg(not(feature = "core-net"))]
 fn call_tls_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1578,6 +1593,7 @@ fn call_tls_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
 }
 
 /// Call the TLS write import (synchronous - blocks until complete).
+#[cfg(not(feature = "core-net"))]
 fn call_tls_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1623,6 +1639,7 @@ fn call_tls_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
 }
 
 /// Call the TLS close import (synchronous).
+#[cfg(not(feature = "core-net"))]
 fn call_tls_close(handle: u32) {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -1639,6 +1656,55 @@ fn call_tls_close(handle: u32) {
         cx.push_u32(handle);
         import_func.call_import_sync(&mut cx);
     });
+}
+
+// -----------------------------------------------------------------------------
+// core-net delegations
+//
+// When `core-net` is enabled the wit-dylib implementations above are compiled
+// out and these thin wrappers forward the private call_* layer to the plain
+// monocp.* core imports in `core_net`. The public do_tcp_*/do_tls_* surface is
+// unchanged, so python.rs's _mcpone builtins are unaffected.
+// -----------------------------------------------------------------------------
+
+#[cfg(feature = "core-net")]
+fn call_tcp_connect(host: &str, port: u16) -> Result<NetResult<u32>, String> {
+    core_net::call_tcp_connect(host, port)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tcp_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
+    core_net::call_tcp_read(handle, len)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tcp_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
+    core_net::call_tcp_write(handle, data)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tcp_close(handle: u32) {
+    core_net::call_tcp_close(handle);
+}
+
+#[cfg(feature = "core-net")]
+fn call_tls_upgrade(tcp_handle: u32, hostname: &str) -> Result<NetResult<u32>, String> {
+    core_net::call_tls_upgrade(tcp_handle, hostname)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tls_read(handle: u32, len: u32) -> Result<NetResult<Vec<u8>>, String> {
+    core_net::call_tls_read(handle, len)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tls_write(handle: u32, data: &[u8]) -> Result<NetResult<u32>, String> {
+    core_net::call_tls_write(handle, data)
+}
+
+#[cfg(feature = "core-net")]
+fn call_tls_close(handle: u32) {
+    core_net::call_tls_close(handle);
 }
 
 /// TLS error discriminant to error name mapping.
@@ -2366,7 +2432,9 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
             .read_to_string(&mut code)
             .map_err(|err| format!("Failed to read Python code from stdin: {err}"))?;
         if code.trim().is_empty() {
-            return Err("no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string());
+            return Err(
+                "no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string(),
+            );
         }
         return Ok(CliRunInput {
             code,
@@ -2374,7 +2442,10 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         });
     }
 
-    Err("python wasi:cli/run currently supports `-c <code>`, `python <script.py>`, or piped stdin".to_string())
+    Err(
+        "python wasi:cli/run currently supports `-c <code>`, `python <script.py>`, or piped stdin"
+            .to_string(),
+    )
 }
 
 #[derive(Debug, Clone)]

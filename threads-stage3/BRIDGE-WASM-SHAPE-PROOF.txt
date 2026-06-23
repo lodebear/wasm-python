@@ -1,0 +1,36 @@
+STAGE C — threaded CPython core module with the mcpone guest bridge,
+networking/TLS bound to PLAIN CORE imports. Captured 2026-06-23T21:11:16Z.
+Toolchain: wasi-sdk-27 (clang 20.1.8), wasm-tools 1.244.0, wasmtime 41.0.4.
+
+== python-threads-bridge.wasm (production --import-memory shape) ==
+magic: 00000000: 0061 736d 0100 0000                      .asm....
+-- threads + command shape --
+(import "env" "memory" (memory (;0;) 50 4096 shared))
+(import "wasi" "thread-spawn" (func $__imported_wasi_thread_spawn (;54;) (type 0)))
+(export "memory" (memory 0))
+(export "_start" (func $_start))
+(export "wasi_thread_start" (func $wasi_thread_start))
+-- target_features --
+  +atomics
+  +bulk-memory
+-- 14 monocp.* plain core imports --
+  monocp.dns_close
+  monocp.dns_resolve
+  monocp.dns_resolve_next
+  monocp.net_instance
+  monocp.tcp_close
+  monocp.tcp_create
+  monocp.tcp_finish_connect
+  monocp.tcp_read
+  monocp.tcp_start_connect
+  monocp.tcp_write
+  monocp.tls_close
+  monocp.tls_read
+  monocp.tls_upgrade
+  monocp.tls_write
+-- validation --
+  CORE MODULE VALID (threads)
+
+== standalone import smoke (self-memory variant, monocp+wasi preloaded) ==
+  scripts/run-cpython-threads-bridge.sh  =>  THREAD-IMPORT-OK socket ssl
+  ssl is the host shim (ssl.__doc__ contains 'MCP One'); _mcpone._mcpone_tls_upgrade present.
