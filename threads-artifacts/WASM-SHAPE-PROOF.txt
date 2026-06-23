@@ -1,0 +1,27 @@
+# wasm-tools shape confirmation for static threaded python.wasm
+# Generated Tue 23 Jun 2026 18:44:07 BST from /Users/michael/Development/mine/monocp-wasm-apps/python/.worktrees/threads-keystone/threads-build/cpython/cross-build/wasm32-wasi/python.wasm
+# wasm-tools 1.244.0; wasmtime 41.0.4; wasi-sdk-27 (clang 20.1.8)
+
+## Memory (shared + imported + exported):
+    0x2c47 | 06 6d 65 6d | export Export { name: "memory", kind: Memory, index: 0 }
+
+## wasi:thread-spawn import + wasi_thread_start export:
+     0x970 | 04 77 61 73 | import [func 42] Import { module: "wasi", name: "thread-spawn", ty: Func(0) }
+    0x2c59 | 11 77 61 73 | export Export { name: "wasi_thread_start", kind: Func, index: 8873 }
+ 0x1adb717 | a9 45 11 77 | Naming { index: 8873, name: "wasi_thread_start" }
+
+## validate --features threads:
+RESULT: VALID
+
+## target_features (atomics present):
+ 1adb962 6d6f7279 2d6f7074 2b166361 6c6c2d69  mory-opt+.call-i  1adb972 6e646972 6563742d 6f766572 6c6f6e67  ndirect-overlong  1adb982 2b0e6578 74656e64 65642d63 6f6e7374  +.extended-const  1adb992 2b0a6d75 6c746976 616c7565 2b0f6d75  +.multivalue+.mu  1adb9a2 7461626c 652d676c 6f62616c 732b136e  table-globals+.n  1adb9b2 6f6e7472 61707069 6e672d66 70746f69  ontrapping-fptoi  1adb9c2 6e742b0f 72656665 72656e63 652d7479  nt+.reference-ty  1adb9d2 7065732b 08736967 6e2d6578 74        pes+.sign-ext 
+## atomic op count (dump grep):
+1597
+
+## EXACT shared memory import (env.memory, shared=true):
+     0x310 | 03 65 6e 76 | import [memory 0] Import { module: "env", name: "memory", ty: Memory(MemoryType { memory64: false, shared: true, initial: 48, maximum: Some(160), page_size_log2: None }) }
+
+## RUN CONFIRMATION (wasmtime 41.0.4, -W threads=y -W shared-memory=y -S threads=y):
+   python.wasm -c 'print(1+1)'        => 2
+   4x threading.Thread squares        => threads ran: [0, 1, 4, 9]
+   3x distinct _thread.get_ident()    => distinct thread idents: 3 (main not in worker set)

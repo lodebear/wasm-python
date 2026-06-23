@@ -1,0 +1,71 @@
+# Stage 2 — STATIC THREADED CPython for wasm32-wasip1-threads (DELIVERED)
+
+This directory holds the **static, threaded** CPython 3.14 wasm artifacts produced
+in Stage 2, plus the wasm-tools shape proof. It is the retarget of the Stage 1
+single-threaded baseline (which was a *dynamic/PIC* re-link of prebuilt `.so`s).
+
+## What was built
+
+A **static** CPython core module (`python.wasm`) and its **static** archive
+(`libpython3.14.a`), compiled `-target wasm32-wasi-threads -pthread` against the
+**threaded static wasi-libc sysroot** that ships in wasi-sdk-27 at
+`share/wasi-sysroot/lib/wasm32-wasip1-threads` (`libc.a`, `libc++.a`, etc.).
+
+- `python-threads.wasm.zst`     — zstd of `cross-build/wasm32-wasi/python.wasm` (26.9 MiB raw)
+- `libpython3.14-threads.a.zst` — zstd of the static threaded `libpython3.14.a` (37.8 MiB raw)
+- `WASM-SHAPE-PROOF.txt`        — wasm-tools dump/validate output (the shape evidence)
+
+## How it was built (reproducible)
+
+```
+scripts/build-cpython-threads.sh native          # native build python (cross prereq)
+scripts/build-cpython-threads.sh configure-host   # ./configure --enable-wasm-pthreads, STATIC (no --enable-shared)
+scripts/build-cpython-threads.sh make-host         # -> cross-build/wasm32-wasi/python.wasm + libpython3.14.a
+```
+
+Source: `dicej/cpython` branch `v3.14.0-wasi-sdk-27` (the same lineage as the
+shipped single-threaded baseline lib). Toolchain: wasi-sdk-27 (clang 20.1.8).
+
+The load-bearing knob is CPython's own `--enable-wasm-pthreads`, which makes
+`configure` append (verified in the generated Makefile):
+
+```
+CONFIGURE_CFLAGS=        -target wasm32-wasi-threads -pthread
+CONFIGURE_LDFLAGS_NODIST= -target wasm32-wasi-threads -pthread \
+    -Wl,--import-memory -Wl,--export-memory -Wl,--max-memory=10485760
+LDLIBRARY = libpython3.14.a      PY_ENABLE_SHARED = 0   (STATIC)
+```
+
+NOTE on the `--host` triple: `config.sub` rejects `wasm32-wasip1-threads`
+("OS 'threads' not recognized"). The accepted host triple is `wasm32-wasi`;
+`--enable-wasm-pthreads` is what injects the `wasm32-wasi-threads` target and
+the shared-memory link flags. (This is how CPython upstream builds WASI threads.)
+
+## Confirmed shape (wasm-tools 1.244.0) — see WASM-SHAPE-PROOF.txt
+
+- `import "env" "memory" ... shared: true`  — SHARED linear memory, imported (wasi-threads)
+- `export "memory"`                         — memory EXPORTED (a worker can import it)
+- `export "wasi_thread_start"`              — thread entry export
+- `import "wasi" "thread-spawn"`            — wasi thread-spawn import (the ffmpeg shape)
+- `target_features` contains `+atomics` (+bulk-memory ...); 1597 atomic ops
+- `wasm-tools validate --features threads` => VALID
+
+## Confirmed execution (wasmtime 41.0.4, threads enabled)
+
+```
+scripts/run-cpython-threads.sh 'print(1+1)'   # => 2
+```
+
+Real OS threads verified:
+- 4x `threading.Thread` computing squares => `[0, 1, 4, 9]`
+- 3x workers report 3 distinct `_thread.get_ident()`, none equal to the main thread
+
+## Not (yet) done — the follow-on for the mcpone reactor
+
+This delivers a static threaded CPython **command** core module (the Stage-2 gate).
+Wiring the threaded static `libpython3.14.a` into the mcpone **reactor** component
+(linking the pyo3 guest bridge, exporting `execute`, and threading the
+`wasi:thread-spawn` import out through the component model) is the next stage:
+the existing `src/linker.rs` path uses `wit_component::Linker` for *dynamic/PIC*
+shared-everything linking, which is the dead end for threads — a threaded reactor
+must instead be statically linked, then componentized with a thread-aware adapter.

@@ -21,3 +21,7 @@ crates/mcpone-python-wasm-runtime/tests/site-packages/
 
 # OS cruft
 **/.DS_Store
+
+# Stage 2 threaded CPython build tree (cloned source + build outputs, ~380M).
+# The resulting artifacts are committed (compressed) under threads-artifacts/.
+threads-build/
