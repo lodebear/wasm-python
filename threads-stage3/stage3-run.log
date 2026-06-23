@@ -1,0 +1,71 @@
+## STEP 0: baseline shape of the Stage-2 threaded module (IMPORTS env.memory shared)
+  (import "env" "memory" (memory (;0;) 48 160 shared))
+  (import "wasi" "thread-spawn" (func $__imported_wasi_thread_spawn (;42;) (type 0)))
+  (export "memory" (memory 0))
+  (export "_start" (func $_start))
+
+## WALL 1: component new on the as-built module fails on wasi.thread-spawn
+## (wasi:thread-spawn is NOT a WIT interface; the component model can't bind it)
+   error: failed to encode a component from module
+   
+   Caused by:
+       0: failed to decode world from module
+       1: module was not valid
+       2: failed to resolve import `wasi::thread-spawn`
+       3: module requires an import interface named `wasi`
+
+## Build a stub adapter that satisfies wasi.thread-spawn so we can get past WALL 1
+
+## WALL 2: with thread-spawn stubbed, the module still IMPORTS env.memory
+## => 'main module cannot import memory' (single-module reactor flow assumes the
+##    main module DEFINES+EXPORTS its own memory; wasi-threads --import-memory breaks this)
+   error: failed to encode a component from module
+   
+   Caused by:
+       0: failed to satisfy import `env::memory`
+       1: main module cannot import memory
+
+## FIX for WALL 2: RELINK the threaded libpython WITHOUT -Wl,--import-memory
+## (keep --shared-memory --export-memory). The module then DEFINES+EXPORTS its
+## own shared memory: the P4 'provider exports shared memory' shape.
+## relinked module memory shape (NO env.memory import; DEFINES+EXPORTS shared memory):
+     (memory (;0;) 48 160 shared)
+     (export "memory" (memory 0))
+   core module VALID (threads)
+
+## WALL 3: componentize the self-mem module with the STOCK reactor adapter
+## => the adapter imports a NON-shared env.memory; provider exports SHARED.
+##    'mismatch in the shared flag for memories'
+   error: failed to encode a component from module
+   
+   Caused by:
+       0: failed to validate component output
+       1: type mismatch for export `memory` of module instantiation argument `env`
+          mismatch in the shared flag for memories (at offset 0x1ad12af)
+
+## Patch the reactor adapter's env.memory import to be SHARED (match 48 160 shared)
+
+## WALL 4 (THE HARD ONE): componentize with the SHARED-memory adapter.
+## => 'canonical ABI memory is not a 32-bit linear memory /
+##    mismatch in the shared flag for memories'
+## The component-model canonical ABI (wasmparser cabi_memory_at) HARD-REQUIRES
+## shared:false for the lifting/lowering memory. A wasi-threads module has only
+## ONE memory and it MUST be shared. => architecturally cannot componentize today.
+   error: failed to encode a component from module
+   
+   Caused by:
+       0: failed to validate component output
+       1: canonical ABI memory is not a 32-bit linear memory
+          mismatch in the shared flag for memories (at offset 0x1ad17e8)
+
+## CONTROL: a trivial module that DEFINES+EXPORTS a shared memory DOES componentize+validate,
+## proving the spec supports a component whose inner core module exports shared memory --
+## the wall is specifically the canonical-ABI memory, not shared memory per se.
+   shared-memory-exporting reactor COMPONENT VALID
+       (memory (;0;) 1 2 shared)
+       (export "memory" (memory 0))
+
+## SUMMARY: P4 memory topology (provider exports shared memory) is reachable at the
+## CORE level and survives into a component. The componentization of the THREADED
+## CPython REACTOR is blocked because the component canonical ABI forbids using the
+## (only, shared) memory for argument lifting/lowering. See STAGE3-WALL.md.
