@@ -176,8 +176,17 @@ fn build_component() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     Ok(linker.encode()?)
 }
 
-#[tokio::test]
-async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> {
+/// Build, instantiate, and wire up the Python runtime component, returning the store and
+/// the typed `execute` function. Shared by the integration tests so each can run probes
+/// against a fresh runtime without duplicating the (sizable) host-import wiring.
+async fn setup_execute() -> Result<
+    (
+        Store<State>,
+        wasmtime::component::Instance,
+        wasmtime::component::TypedFunc<(String,), (Result<ExecuteOutput, String>,)>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     println!("Building component...");
     let component_bytes = build_component()?;
     println!("Component size: {} bytes", component_bytes.len());
@@ -430,6 +439,13 @@ async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> 
                 &mut store, "execute",
             )
         })?;
+
+    Ok((store, instance, execute))
+}
+
+#[tokio::test]
+async fn test_instantiate_component() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut store, instance, execute) = setup_execute().await?;
 
     // Test 1: Simple print statement
     println!("Test 1: execute('print(1+1)')...");
@@ -1017,6 +1033,100 @@ print(f"stderr_is_none={res.stderr is None}")
     }
 
     println!("\nAll tests passed!");
+    Ok(())
+}
+
+/// The writer monocp swaps in as sys.stdout/sys.stderr is captured/streamed, never a TTY.
+/// It must present a correct, non-interactive file-like interface so that pip/rich and common
+/// CLI libraries degrade naturally (e.g. isatty() -> False) instead of raising AttributeError.
+#[tokio::test]
+async fn test_streaming_writer_interface() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut store, _instance, execute) = setup_execute().await?;
+
+    // The file-like contract _McponeStreamingWriter must satisfy.
+    println!("streaming writer: file-like interface...");
+    let (result,) = execute
+        .call_async(
+            &mut store,
+            (r#"
+import sys, io
+errs = []
+def check(cond, name):
+    if not cond:
+        errs.append(name)
+# Non-interactive: isatty must return False and never raise (pip spinners.py:138 calls it directly).
+check(sys.stdout.isatty() is False, "stdout.isatty!=False")
+check(sys.stderr.isatty() is False, "stderr.isatty!=False")
+# Idiomatic text stream: a real sys.stdout is an io.TextIOBase.
+check(isinstance(sys.stdout, io.TextIOBase), "not-TextIOBase")
+# Capability queries.
+check(sys.stdout.writable() is True, "writable!=True")
+check(sys.stdout.readable() is False, "readable!=False")
+check(sys.stdout.seekable() is False, "seekable!=False")
+check(sys.stdout.closed is False, "closed!=False")
+# Text attributes consumers read (rich getattr(file,'encoding'); click reads encoding/errors).
+check(sys.stdout.encoding == "utf-8", "encoding!=utf-8")
+check(sys.stdout.errors == "strict", "errors!=strict")
+# No real fd: fileno() must raise io.UnsupportedOperation (which is both OSError and ValueError).
+try:
+    sys.stdout.fileno()
+    errs.append("fileno-did-not-raise")
+except io.UnsupportedOperation as e:
+    check(isinstance(e, OSError) and isinstance(e, ValueError), "fileno-exc-mro")
+except Exception as e:
+    errs.append("fileno-raised-" + type(e).__name__)
+# reconfigure() is a no-op that accepts kwargs (user scripts call sys.stdout.reconfigure(encoding=...)).
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stdout.reconfigure()
+sys.stderr.reconfigure(encoding="utf-8", errors="strict")
+# write() returns the character count and streams to the host.
+check(sys.stdout.write("XY") == 2, "write-len")
+# The singleton is reused across executions: close() must be a no-op that leaves it usable.
+sys.stdout.close()
+check(sys.stdout.closed is False, "closed-after-close")
+check(sys.stdout.write("Z") == 1, "write-after-close")
+print("WRITER_OK" if not errs else "WRITER_FAIL:" + ",".join(errs))
+"#
+            .to_string(),),
+        )
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            println!("  OK: {output:?}");
+            assert!(
+                output.stdout.contains("WRITER_OK"),
+                "streaming writer interface incomplete: {output:?}"
+            );
+        }
+        Err(error) => {
+            panic!("writer interface probe failed: {error}");
+        }
+    }
+
+    // The persistent writer singleton keeps capturing output across execute() calls even after
+    // a prior call invoked close() on it (regression guard for the no-op close()).
+    println!("streaming writer: reuse after close across execute() calls...");
+    let (result,) = execute
+        .call_async(&mut store, ("print('REUSE_OK')".to_string(),))
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            println!("  OK: {output:?}");
+            assert_eq!(
+                output.stdout.trim(),
+                "REUSE_OK",
+                "writer should still capture output after a prior close(): {output:?}"
+            );
+        }
+        Err(error) => {
+            panic!("writer reuse probe failed: {error}");
+        }
+    }
+
     Ok(())
 }
 

@@ -1203,6 +1203,7 @@ const MCPONE_EXEC_INFRASTRUCTURE: &str = r#"
 import sys as _sys
 import ast as _ast
 import types as _types
+import io as _io
 
 # Patch socket.socketpair before importing asyncio
 # WASI doesn't support socketpair, so we create a dummy that works for asyncio's self-pipe
@@ -1238,15 +1239,18 @@ _socket.socketpair = _dummy_socketpair
 
 # Streaming writer that both accumulates text and streams each write to the host.
 # Replaces StringIO for stdout/stderr capture so output appears in real-time.
-# Uses duck typing (plain class) rather than inheriting from _io.TextIOBase
-# because _io.TextIOBase may not be available in all WASI Python builds.
-class _McponeStreamingWriter:
+#
+# Subclasses io.TextIOBase so it presents the real file-like / text-stream interface
+# that pip, rich and other CLI libraries probe on sys.stdout/sys.stderr. Subclassing
+# gives the correct non-interactive defaults for free: isatty() -> False, fileno() ->
+# raises io.UnsupportedOperation (which is both OSError and ValueError), and
+# readable()/seekable() -> False. Agent output is captured/streamed, never an
+# interactive terminal, so those defaults are exactly what we want.
+class _McponeStreamingWriter(_io.TextIOBase):
     def __init__(self, stream_id):
+        super().__init__()
         self._stream_id = stream_id
         self._buffer = []
-        self.encoding = 'utf-8'
-        self.errors = 'strict'
-        self.newlines = None
     def write(self, s):
         if not isinstance(s, str):
             raise TypeError("write() argument must be str")
@@ -1254,21 +1258,37 @@ class _McponeStreamingWriter:
             self._buffer.append(s)
             _mcpone_mod._mcpone_report_output(self._stream_id, s)
         return len(s)
-    def getvalue(self):
-        return ''.join(self._buffer)
-    def reset(self):
-        self._buffer.clear()
+    def isatty(self):
+        # Explicit and load-bearing: pip calls sys.stdout.isatty() directly
+        # (e.g. cli/spinners.py) and must get a bool, never an AttributeError.
+        return False
     def writable(self):
         return True
-    def seekable(self):
-        return False
-    def readable(self):
-        return False
+    @property
+    def encoding(self):
+        # io.TextIOBase.encoding is a read-only None descriptor; consumers such as
+        # rich and click read it, so expose our real (always utf-8) encoding.
+        return 'utf-8'
+    @property
+    def errors(self):
+        return 'strict'
+    def reconfigure(self, *args, **kwargs):
+        # TextIOWrapper-only API that some scripts call (sys.stdout.reconfigure(encoding=...)).
+        # The stream is always utf-8 text, so accept any args and do nothing.
+        pass
     def flush(self):
+        pass
+    def close(self):
+        # These writers are singletons reused across every execution; a real close() would
+        # mark the stream permanently closed. Keep it open by making close a no-op.
         pass
     @property
     def closed(self):
         return False
+    def getvalue(self):
+        return ''.join(self._buffer)
+    def reset(self):
+        self._buffer.clear()
 
 # Persistent stdout/stderr capture - created once, reused across executions
 _mcpone_stdout = _McponeStreamingWriter(0)
