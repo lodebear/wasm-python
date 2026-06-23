@@ -32,9 +32,18 @@ The load-bearing knob is CPython's own `--enable-wasm-pthreads`, which makes
 ```
 CONFIGURE_CFLAGS=        -target wasm32-wasi-threads -pthread
 CONFIGURE_LDFLAGS_NODIST= -target wasm32-wasi-threads -pthread \
-    -Wl,--import-memory -Wl,--export-memory -Wl,--max-memory=10485760
+    -Wl,--import-memory -Wl,--export-memory -Wl,--max-memory=268435456
 LDLIBRARY = libpython3.14.a      PY_ENABLE_SHARED = 0   (STATIC)
 ```
+
+NOTE on `--max-memory`: CPython's `configure` hardcodes a 10 MiB cap
+(`-Wl,--max-memory=10485760`) under `--enable-wasm-pthreads`. A host cannot grow
+a shared memory past the module's declared maximum, so 10 MiB OOMs heavy stdlib
+(`concurrent.futures.ThreadPoolExecutor`, `urllib`/`ssl`, `pip`). The build
+script now appends `-Wl,--max-memory=268435456` (256 MiB = 4096 pages, matching
+ffmpeg's cap) via `LDFLAGS_NODIST` in `configure-host`; wasm-ld honours the LAST
+`--max-memory`, so this overrides the default without patching CPython. Override
+with `MAX_MEMORY=<bytes>`.
 
 NOTE on the `--host` triple: `config.sub` rejects `wasm32-wasip1-threads`
 ("OS 'threads' not recognized"). The accepted host triple is `wasm32-wasi`;
@@ -43,11 +52,11 @@ the shared-memory link flags. (This is how CPython upstream builds WASI threads.
 
 ## Confirmed shape (wasm-tools 1.244.0) — see WASM-SHAPE-PROOF.txt
 
-- `import "env" "memory" ... shared: true`  — SHARED linear memory, imported (wasi-threads)
+- `import "env" "memory" ... shared: true, maximum 4096`  — SHARED linear memory, imported (wasi-threads), 256 MiB cap
 - `export "memory"`                         — memory EXPORTED (a worker can import it)
 - `export "wasi_thread_start"`              — thread entry export
 - `import "wasi" "thread-spawn"`            — wasi thread-spawn import (the ffmpeg shape)
-- `target_features` contains `+atomics` (+bulk-memory ...); 1597 atomic ops
+- `target_features` contains `+atomics` (+bulk-memory ...)
 - `wasm-tools validate --features threads` => VALID
 
 ## Confirmed execution (wasmtime 41.0.4, threads enabled)
@@ -57,8 +66,9 @@ scripts/run-cpython-threads.sh 'print(1+1)'   # => 2
 ```
 
 Real OS threads verified:
-- 4x `threading.Thread` computing squares => `[0, 1, 4, 9]`
-- 3x workers report 3 distinct `_thread.get_ident()`, none equal to the main thread
+- `threading.Thread` start/join => `OK [1]`
+- `concurrent.futures.ThreadPoolExecutor(max_workers=4)` => `POOL OK 30`
+  (`sum(ex.map(lambda x: x*x, range(5)))` == 30; raised `MemoryError` under the old 10 MiB cap)
 
 ## Not (yet) done — the follow-on for the mcpone reactor
 
