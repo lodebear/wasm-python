@@ -37,7 +37,15 @@ fn stream_to_real_fd(stream: u32, data: &str) {
 
 /// C-callable entry. Initializes the interpreter exactly like the reactor
 /// (registering `_mcpone` + the socket/ssl/subprocess shims), then runs the
-/// program from the `MCPONE_CODE` env var (or a default import smoke).
+/// program selected by the WASI command-line, using the SAME dispatch the
+/// preview2 reactor's `wasi:cli/run` path uses (`-c <code>`, `-m <mod> [args]`,
+/// `<script.py> [args]`, and `-`/piped stdin).
+///
+/// The preview1 thread runner passes the full argv through WASI
+/// (`args_get`/`args_sizes_get`), so `std::env::args()` here mirrors what the
+/// agent typed: argv[0] is "python", followed by the user's tokens. This makes
+/// the threaded core module behave like CPython's CLI rather than reading a
+/// magic `MCPONE_CODE` env var.
 ///
 /// Returns 0 on success, non-zero if Python execution reported an error.
 ///
@@ -53,14 +61,25 @@ pub extern "C" fn mcpone_threads_main() -> c_int {
     // injects the _mcpone_async / socket / ssl / subprocess shims.
     python::initialize_python();
 
-    let code = std::env::var("MCPONE_CODE").unwrap_or_else(|_| {
-        // Default smoke: prove the host-backed socket/ssl shims at least LOAD in
-        // the threaded core module.
-        "import socket\nimport ssl\nprint('THREAD-IMPORT-OK', socket.__name__, ssl.__name__)\n"
-            .to_string()
-    });
+    // Resolve the program from argv exactly like the reactor's wasi:cli/run
+    // handler. This is the SAME `extract_code_from_python_cli_args` the preview2
+    // component uses, so `-c` / `-m` / script / stdin all behave identically and
+    // there is no second, drifting dispatch to maintain.
+    let argv: Vec<String> = std::env::args().collect();
+    let input = match crate::extract_code_from_python_cli_args(&argv) {
+        Ok(input) => input,
+        Err(message) => {
+            eprintln!("{message}");
+            return 1;
+        }
+    };
 
-    match python::execute_python(&code) {
+    let result = match input.filename.as_deref() {
+        Some(filename) => python::execute_python_with_filename(&input.code, filename),
+        None => python::execute_python(&input.code),
+    };
+
+    match result {
         python::ExecuteResult::Complete(_output) => {
             // Output was already streamed to the real fds via the report-output
             // callback (the streaming writer flushes on each write), so we do not

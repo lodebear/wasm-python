@@ -2399,6 +2399,38 @@ enum HandleExportResult {
     Pending(u32),
 }
 
+/// Render a Rust string as a single-quoted Python string literal, escaping the
+/// few characters that would otherwise break out of the quotes. Used to build
+/// the `runpy.run_module` snippet for `python -m` without risking injection from
+/// a module name or argv element.
+fn python_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Render a slice of strings as a Python list literal of string literals, e.g.
+/// `['foo', 'bar']`. Used to set `sys.argv` for the `python -m` form.
+fn python_list_literal(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| python_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
 fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, String> {
     if argv.len() == 2 && argv[1] == "-c" {
         return Err("python wasi:cli/run requires a code string after -c".to_string());
@@ -2408,6 +2440,29 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         return Ok(CliRunInput {
             code: argv[2].clone(),
             filename: None,
+        });
+    }
+
+    if argv.len() == 2 && argv[1] == "-m" {
+        return Err("python wasi:cli/run requires a module name after -m".to_string());
+    }
+
+    if argv.len() >= 3 && argv[1] == "-m" {
+        // `python -m <mod> [args]`: defer to runpy exactly like the CPython CLI,
+        // running the module as `__main__` with sys.argv set to ['<mod-path>', ...].
+        // The args AFTER the module name become sys.argv[1:]; argv[0] is the
+        // module name itself (CPython rewrites it to the script path, but the
+        // module name is a faithful-enough stand-in for our sandbox).
+        let module = argv[2].clone();
+        let argv_literal = python_list_literal(&argv[2..]);
+        let module_literal = python_string_literal(&module);
+        return Ok(CliRunInput {
+            code: format!(
+                "import runpy as _mcpone_runpy, sys as _mcpone_sys\n\
+                 _mcpone_sys.argv = {argv_literal}\n\
+                 _mcpone_runpy.run_module({module_literal}, run_name='__main__', alter_sys=True)"
+            ),
+            filename: Some(format!("<module {module}>")),
         });
     }
 
