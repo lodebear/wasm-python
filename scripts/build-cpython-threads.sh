@@ -50,15 +50,33 @@ case "${1:-all}" in
     python3 Tools/wasm/wasi make-build-python --quiet
     ;;
   configure-host)
+    # zlib deps (built by scripts/build-zlib-threads.sh) so CPython's configure
+    # detects zlib (it has no zlib.pc for pkg-config, so it falls back to the
+    # zlib.h header + `gzread in -lz` link check; -I/-L make both succeed). This
+    # turns MODULE_ZLIB_STATE on so the `zlib` C extension is compiled into
+    # libpython3.14.a — needed by pip (vendored `rich` imports zlib; ZipFile
+    # ZIP_DEFLATED needs zlib). Mirrors the preview2 component build, which links
+    # deps/lib/libz.a (RUNTIME-BUILD.md §3).
+    DEPS="$ROOT/threads-build/deps"
+    if [ ! -f "$DEPS/lib/libz.a" ]; then
+      echo "ERROR: missing $DEPS/lib/libz.a; run scripts/build-zlib-threads.sh first" >&2
+      exit 1
+    fi
     # Append a larger --max-memory after CPython's hardcoded 10 MiB one; wasm-ld
     # uses the last --max-memory, so this raises the shared-memory cap.
+    # NOTE: host-triple is wasm32-wasi (NOT wasm32-wasip1-threads): config.sub
+    # does not recognize an "os=threads", and --enable-wasm-pthreads is what
+    # retargets the toolchain to `-target wasm32-wasi-threads -pthread` + shared
+    # memory. The cross-build output therefore lives in cross-build/wasm32-wasi.
+    CFLAGS="${CFLAGS:-} -I${DEPS}/include" \
+    LDFLAGS="${LDFLAGS:-} -L${DEPS}/lib" \
     LDFLAGS_NODIST="${LDFLAGS_NODIST:-} -Wl,--max-memory=${MAX_MEMORY}" \
     python3 Tools/wasm/wasi configure-host \
-      --host-triple wasm32-wasip1-threads \
+      --host-triple wasm32-wasi \
       -- --enable-wasm-pthreads --disable-test-modules
     ;;
   make-host)
-    python3 Tools/wasm/wasi make-host --host-triple wasm32-wasip1-threads
+    python3 Tools/wasm/wasi make-host --host-triple wasm32-wasi
     ;;
   all)
     "$0" native

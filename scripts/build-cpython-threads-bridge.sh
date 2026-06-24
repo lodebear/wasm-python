@@ -49,13 +49,25 @@ echo "## 2) Compile the C command entry (calls mcpone_threads_main())"
 "$SDK/bin/clang" --target=wasm32-wasi-threads -pthread -O2 -c \
   "$ROOT/threads-stage3/mcpone_threads_main.c" -o "$OUT/mcpone_threads_main.o"
 
-# Shared archive list: threaded libpython + the hacl/decimal/expat static deps.
+# zlib static archive (built by scripts/build-zlib-threads.sh). libpython3.14.a
+# now contains zlibmodule.o (the CPython `zlib` C extension, enabled in the
+# cross-build), which references deflate/inflate/gzread etc., so libz.a MUST be
+# on the link line or the bridge fails with undefined symbols. This closes pip's
+# zlib dependency (vendored `rich` imports zlib; ZipFile ZIP_DEFLATED needs it).
+ZLIB_A="$ROOT/threads-build/deps/lib/libz.a"
+if [ ! -f "$ZLIB_A" ]; then
+  echo "ERROR: missing $ZLIB_A; run scripts/build-zlib-threads.sh first" >&2
+  exit 1
+fi
+
+# Shared archive list: threaded libpython + the hacl/decimal/expat/zlib static deps.
 ARCHIVES=(
   "$CP/libpython3.14.a"
   "$CP/Modules/_hacl/libHacl_Hash_BLAKE2.a" "$CP/Modules/_hacl/libHacl_Hash_SHA3.a"
   "$CP/Modules/_hacl/libHacl_Hash_MD5.a"    "$CP/Modules/_hacl/libHacl_Hash_SHA1.a"
   "$CP/Modules/_hacl/libHacl_HMAC.a"        "$CP/Modules/_hacl/libHacl_Hash_SHA2.a"
   "$CP/Modules/_decimal/libmpdec/libmpdec.a" "$CP/Modules/expat/libexpat.a"
+  "$ZLIB_A"
 )
 LIBS=( -ldl -lwasi-emulated-signal -lwasi-emulated-getpid -lwasi-emulated-process-clocks -lpthread )
 
