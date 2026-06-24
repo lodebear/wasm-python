@@ -70,6 +70,36 @@ Real OS threads verified:
 - `concurrent.futures.ThreadPoolExecutor(max_workers=4)` => `POOL OK 30`
   (`sum(ex.map(lambda x: x*x, range(5)))` == 30; raised `MemoryError` under the old 10 MiB cap)
 
+## Installing the threaded build as the backend `python` WASI command
+
+Stage C wires the threaded `libpython3.14.a` into the mcpone guest bridge as a
+runnable **core module** (`threads-stage3/`, see `threads-stage3/STAGE-C-NOTES.md`).
+To produce the backend-consumable assets (bridge `.wasm` + merged stdlib) in one
+stable directory, run:
+
+```bash
+scripts/prepare-threaded-python-assets.sh                 # full rebuild
+USE_COMMITTED_ZST=1 scripts/prepare-threaded-python-assets.sh  # reuse committed bridge .zst
+```
+
+Outputs land in `threads-stage3/assets/`:
+- `python-threads-bridge.wasm` — the threaded bridge core module
+- `stdlib/`                     — `cpython/Lib/*` (minus `__pycache__`) +
+  the two cross-build `_sysconfig*` files + an empty `site-packages/`
+
+The backend selects this flavor with the committed switch (no hand-editing the
+gitignored `wasm-tools.sources.yaml`):
+
+```bash
+make -C backend wasm-tools PYTHON_FLAVOR=threaded
+```
+
+whose `MONOCP_THREADED_PYTHON_WASM`/`MONOCP_THREADED_PYTHON_STDLIB` defaults
+point at `threads-stage3/assets/`. The committed
+`threads-stage3/python-threads-bridge.wasm.zst` is kept in sync with the bridge
+that the current guest crate produces, so `USE_COMMITTED_ZST=1` reproduces the
+same `.wasm` without a rust/clang relink.
+
 ## Not (yet) done — the follow-on for the mcpone reactor
 
 This delivers a static threaded CPython **command** core module (the Stage-2 gate).

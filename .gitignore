@@ -37,3 +37,7 @@ threads-stage3/scratch/
 threads-stage3/scratch-c/
 threads-stage3/bridge/
 threads-stage3/*.wasm
+# Derived backend-install assets (bridge .wasm + merged stdlib), produced by
+# scripts/prepare-threaded-python-assets.sh; the bridge .zst is committed and
+# the stdlib is reproduced from the (gitignored) Stage-2 build tree.
+threads-stage3/assets/
