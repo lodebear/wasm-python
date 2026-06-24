@@ -23,8 +23,11 @@
 # OOMs heavy stdlib (concurrent.futures.ThreadPoolExecutor, urllib/ssl, pip).
 # We append a larger `-Wl,--max-memory` to LDFLAGS_NODIST in configure-host;
 # wasm-ld honours the LAST --max-memory, so this overrides the 10 MiB default
-# without patching CPython's configure. 268435456 = 256 MiB = 4096 pages
-# (matches ffmpeg's cap).
+# without patching CPython's configure. 536870912 = 512 MiB = 8192 pages.
+# NOTE: the bridge relink (build-cpython-threads-bridge.sh) re-applies its own
+# --max-memory and is what actually fixes env.memory's declared maximum in the
+# shipped artifact; keep this Stage-2 default in sync with that script. 256 MiB
+# is not enough for `pip install <wheel>` (MemoryError), hence 512 MiB.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +38,7 @@ CP="$ROOT/threads-build/cpython"
 export WASI_SDK_PATH
 
 # Raise the shared-memory cap above CPython's 10 MiB default (see note above).
-: "${MAX_MEMORY:=268435456}"
+: "${MAX_MEMORY:=536870912}"
 export MAX_MEMORY
 
 echo "WASI_SDK_PATH=$WASI_SDK_PATH"

@@ -36,7 +36,15 @@ mkdir -p "$OUT"
 
 : "${WASI_SDK_PATH:=$ROOT/.wasi-sdk/wasi-sdk-27.0-arm64-macos}"
 SDK="$WASI_SDK_PATH"
-: "${MAX_MEMORY:=268435456}"
+# Shared-memory cap for the relinked bridge. wasm-ld honours the LAST
+# --max-memory, so this relink flag is what fixes the final declared maximum of
+# env.memory (it overrides whatever Stage-2 baked in). 536870912 = 512 MiB =
+# 8192 pages. 256 MiB OOMs `pip install <wheel>` (the local-wheel e2e hits
+# MemoryError during the build/unpack); 512 MiB lets it complete. Cost: each
+# thread/instance reserves up to this much *virtual* address space for the
+# shared linear memory (committed lazily on growth), so a 512 MiB cap doubles
+# the per-instance VM reservation vs 256 MiB.
+: "${MAX_MEMORY:=536870912}"
 
 echo "## 1) Build the guest bridge staticlib for wasm32-wasip1-threads (core-net + threads-command)"
 ( cd "$RUNTIME_CRATE" && rustup run nightly cargo build \
