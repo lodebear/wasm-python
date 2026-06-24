@@ -32,6 +32,13 @@ pub mod python;
 #[cfg(feature = "core-net")]
 pub mod core_net;
 
+// Plain-core-import subprocess for the THREADED preview1 CPython core module.
+// When `core-net` is enabled `do_subprocess_run`'s host-reaching spawn/wait
+// triple is replaced by a single `monocp.exec_with_context_v2` core import
+// here instead of the wit-dylib `monocp:host/monocp@0.2.0` component path.
+#[cfg(feature = "core-net")]
+pub mod core_process;
+
 #[cfg(feature = "threads-command")]
 pub mod threads_command;
 
@@ -1893,10 +1900,11 @@ pub fn do_tls_close(handle: u32) {
 // Host process execution wrappers (monocp:host/monocp@0.2.0)
 // =============================================================================
 
+#[cfg(not(feature = "core-net"))]
 const MONOCP_PROCESS_INTERFACE: &str = "monocp:host/monocp@0.2.0";
 
 #[derive(Debug, Clone)]
-enum ProcessFdTarget {
+pub(crate) enum ProcessFdTarget {
     Inherit,
     Close,
     PipeRead(u32),
@@ -1907,9 +1915,9 @@ enum ProcessFdTarget {
 }
 
 #[derive(Debug, Clone)]
-struct ProcessFdBinding {
-    fd: u32,
-    target: ProcessFdTarget,
+pub(crate) struct ProcessFdBinding {
+    pub(crate) fd: u32,
+    pub(crate) target: ProcessFdTarget,
 }
 
 /// Stream handling mode used by the subprocess shim.
@@ -2030,6 +2038,7 @@ fn choose_temp_base_dir(working_dir: &str) -> Result<std::path::PathBuf, String>
     Err("could not find a writable temp directory for subprocess capture".to_string())
 }
 
+#[cfg(not(feature = "core-net"))]
 fn encode_string_list_arg(values: &[String]) -> Value {
     Value::ListArg(
         values
@@ -2040,6 +2049,7 @@ fn encode_string_list_arg(values: &[String]) -> Value {
     )
 }
 
+#[cfg(not(feature = "core-net"))]
 fn encode_fd_target_values(target: &ProcessFdTarget) -> Vec<Value> {
     match target {
         ProcessFdTarget::Inherit => vec![Value::U32(0)],
@@ -2058,6 +2068,7 @@ fn encode_fd_target_values(target: &ProcessFdTarget) -> Vec<Value> {
     }
 }
 
+#[cfg(not(feature = "core-net"))]
 fn encode_fd_bindings_arg(bindings: &[ProcessFdBinding]) -> Value {
     let encoded = bindings
         .iter()
@@ -2071,6 +2082,7 @@ fn encode_fd_bindings_arg(bindings: &[ProcessFdBinding]) -> Value {
     Value::ListArg(encoded)
 }
 
+#[cfg(not(feature = "core-net"))]
 fn call_process_spawn_with_context(
     argv: &[String],
     cwd: &str,
@@ -2106,6 +2118,7 @@ fn call_process_spawn_with_context(
     })
 }
 
+#[cfg(not(feature = "core-net"))]
 fn call_process_wait_child(child_handle: u64) -> Result<Result<i32, String>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -2132,6 +2145,7 @@ fn call_process_wait_child(child_handle: u64) -> Result<Result<i32, String>, Str
     })
 }
 
+#[cfg(not(feature = "core-net"))]
 fn call_process_try_wait_child(child_handle: u64) -> Result<Option<i32>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -2157,6 +2171,7 @@ fn call_process_try_wait_child(child_handle: u64) -> Result<Option<i32>, String>
     })
 }
 
+#[cfg(not(feature = "core-net"))]
 fn call_process_close_child(child_handle: u64) {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -2175,6 +2190,7 @@ fn call_process_close_child(child_handle: u64) {
     });
 }
 
+#[cfg(not(feature = "core-net"))]
 fn call_process_kill_child(child_handle: u64) -> Result<Result<(), String>, String> {
     CURRENT_WIT.with(|cell| {
         let wit = cell.borrow();
@@ -2204,6 +2220,7 @@ fn read_file_or_empty(path: &std::path::Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_default()
 }
 
+#[cfg(not(feature = "core-net"))]
 fn wait_for_child(child_handle: u64, timeout_secs: Option<f64>) -> Result<i32, String> {
     if let Some(timeout) = timeout_secs {
         if timeout.is_sign_negative() {
@@ -2229,6 +2246,44 @@ fn wait_for_child(child_handle: u64, timeout_secs: Option<f64>) -> Result<i32, S
         Ok(status) => Ok(status),
         Err(msg) => Err(msg),
     }
+}
+
+/// Spawn a child, wait for it, and release its handle — the host-reaching part
+/// of `do_subprocess_run`, split out so the threaded `core-net` build can swap
+/// the wit-dylib spawn/wait/close triple for a single `exec_with_context_v2`
+/// core import.
+///
+/// Component (preview2) build: dispatch through the wit-dylib
+/// `monocp:host/monocp@0.2.0` `spawn-with-context` + `wait-child` +
+/// `close-child` family, honouring `timeout_secs` via the try-wait/kill loop in
+/// `wait_for_child`.
+#[cfg(not(feature = "core-net"))]
+fn spawn_wait_close(
+    argv: &[String],
+    working_dir: &str,
+    bindings: &[ProcessFdBinding],
+    timeout_secs: Option<f64>,
+) -> Result<i32, String> {
+    let child_handle = match call_process_spawn_with_context(argv, working_dir, bindings)? {
+        Ok(handle) => handle,
+        Err(msg) => return Err(format!("spawn-with-context failed: {msg}")),
+    };
+
+    let wait_result = wait_for_child(child_handle, timeout_secs);
+    call_process_close_child(child_handle);
+    wait_result
+}
+
+/// Threaded (preview1) build: dispatch through the single blocking
+/// `monocp.exec_with_context_v2` plain core import (see `core_process`).
+#[cfg(feature = "core-net")]
+fn spawn_wait_close(
+    argv: &[String],
+    working_dir: &str,
+    bindings: &[ProcessFdBinding],
+    timeout_secs: Option<f64>,
+) -> Result<i32, String> {
+    core_process::spawn_wait_close(argv, working_dir, bindings, timeout_secs)
 }
 
 /// Execute a subprocess through monocp host process APIs.
@@ -2339,15 +2394,12 @@ pub fn do_subprocess_run(
         },
     ];
 
-    let child_handle = match call_process_spawn_with_context(argv, &working_dir, &bindings)? {
-        Ok(handle) => handle,
-        Err(msg) => return Err(format!("spawn-with-context failed: {msg}")),
-    };
-
-    let wait_result = wait_for_child(child_handle, timeout_secs);
-    call_process_close_child(child_handle);
-
-    let returncode = wait_result?;
+    // Reach the host: the preview2 component build dispatches through the
+    // wit-dylib `monocp:host/monocp@0.2.0` spawn/wait split; the threaded
+    // preview1 core module (`core-net`) instead uses the single blocking
+    // `monocp.exec_with_context_v2` core import. The temp-file capture above
+    // is identical for both.
+    let returncode = spawn_wait_close(argv, &working_dir, &bindings, timeout_secs)?;
 
     let stdout = stdout_capture_path
         .as_ref()
