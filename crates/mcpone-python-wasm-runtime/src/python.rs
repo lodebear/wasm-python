@@ -1967,8 +1967,10 @@ class SocketIO:
     def read(self, size=-1):
         if self._closed:
             raise ValueError("I/O operation on closed file")
+        if size == 0:
+            return b''
         if size < 0:
-            # Read all available data
+            # Read all available data.
             chunks = []
             while True:
                 chunk = self._sock.recv(8192)
@@ -1976,6 +1978,9 @@ class SocketIO:
                     break
                 chunks.append(chunk)
             return b''.join(chunks)
+
+        # This is the raw, unbuffered stream returned by makefile(..., 0).
+        # A raw socket is allowed to return a successful short read.
         return self._sock.recv(size)
 
     def readinto(self, b):
@@ -1985,6 +1990,10 @@ class SocketIO:
         return n
 
     def readline(self, limit=-1):
+        if self._closed:
+            raise ValueError("I/O operation on closed file")
+        if limit == 0:
+            return b''
         # Simple line reading - HTTP headers are typically small
         result = b''
         while True:
@@ -2256,7 +2265,16 @@ class socket:
 
     def makefile(self, mode='r', buffering=-1, **kwargs):
         """Return a file-like object for the socket."""
-        return SocketIO(self, mode)
+        raw = SocketIO(self, mode)
+        if mode != 'rb' or buffering == 0:
+            return raw
+
+        # http.client consumes the default binary makefile as a buffered file:
+        # it expects read(n) to fill n bytes unless the peer reaches EOF.
+        import io
+        if buffering is None or buffering < 0:
+            return io.BufferedReader(raw)
+        return io.BufferedReader(raw, buffering)
 
     def getpeername(self):
         if self._pending_address:

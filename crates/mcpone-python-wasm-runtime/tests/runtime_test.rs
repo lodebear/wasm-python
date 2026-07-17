@@ -1130,6 +1130,137 @@ print("WRITER_OK" if not errs else "WRITER_FAIL:" + ",".join(errs))
     Ok(())
 }
 
+/// socket.makefile() must provide a buffered binary reader by default while
+/// retaining SocketIO's one-read semantics for explicit buffering=0 callers.
+#[tokio::test]
+async fn test_socket_io_buffers_short_reads_for_http_client()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut store, _instance, execute) = setup_execute().await?;
+
+    let (result,) = execute
+        .call_async(
+            &mut store,
+            (r#"
+import http.client
+import socket
+
+class FakeSocket:
+    def __init__(self, data, cap=None, limits=None):
+        self._data = bytearray(data)
+        self._cap = cap
+        self._limits = list(limits or [])
+        self.calls = []
+
+    def recv(self, size):
+        self.calls.append(size)
+        if not self._data:
+            return b''
+        count = min(size, len(self._data))
+        if size > 1 and self._limits:
+            count = min(count, self._limits.pop(0))
+        elif self._cap is not None:
+            count = min(count, self._cap)
+        chunk = bytes(self._data[:count])
+        del self._data[:count]
+        return chunk
+
+    def makefile(self, mode='rb', buffering=-1, **kwargs):
+        # Exercise the shim's real socket.makefile implementation rather than
+        # recreating its buffering behavior in this fake.
+        return socket.socket.makefile(self, mode, buffering, **kwargs)
+
+body = b'x' * 759
+wire = b'HTTP/1.1 200 OK\r\nContent-Length: 759\r\n\r\n' + body
+http_socket = FakeSocket(wire, limits=[245, 514])
+response = http.client.HTTPResponse(http_socket)
+response.begin()
+assert response.read() == body
+assert http_socket._limits == [], http_socket.calls
+
+# The default binary makefile buffers a short raw read, including readinto.
+readinto_socket = FakeSocket(b'abcdef', cap=2)
+buffer = bytearray(6)
+assert socket.socket.makefile(readinto_socket, 'rb').readinto(buffer) == 6
+assert bytes(buffer) == b'abcdef'
+assert len(readinto_socket.calls) > 1
+
+# Explicit unbuffered binary mode preserves the raw one-recv contract.
+unbuffered_socket = FakeSocket(b'abcdef', cap=2)
+unbuffered = socket.socket.makefile(unbuffered_socket, 'rb', buffering=0)
+assert isinstance(unbuffered, socket.SocketIO)
+assert unbuffered.read(6) == b'ab'
+assert unbuffered_socket.calls == [6]
+
+# Zero-size reads must not probe the transport, and read(-1) must still stop
+# only at an actual empty read.
+zero_socket = FakeSocket(b'z', cap=1)
+zero_file = socket.SocketIO(zero_socket, 'rb')
+assert zero_file.read(0) == b''
+assert zero_file.readline(0) == b''
+assert zero_socket.calls == []
+zero_file.close()
+try:
+    zero_file.readline()
+except ValueError:
+    pass
+else:
+    raise AssertionError('closed readline did not raise ValueError')
+all_socket = FakeSocket(b'abcdef', cap=2)
+assert socket.SocketIO(all_socket, 'rb').read() == b'abcdef'
+
+# A true EOF after a partial declared body must remain an IncompleteRead.
+truncated_socket = FakeSocket(
+    b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc', cap=3
+)
+truncated = http.client.HTTPResponse(truncated_socket)
+truncated.begin()
+try:
+    truncated.read()
+except http.client.IncompleteRead as exc:
+    assert exc.partial == b'abc'
+    assert exc.expected == 1
+else:
+    raise AssertionError('expected IncompleteRead for genuine EOF')
+
+class PartialErrorSocket(FakeSocket):
+    def recv(self, size):
+        if self._data:
+            return super().recv(size)
+        raise socket.error('transport error')
+
+partial_error_socket = PartialErrorSocket(
+    b'HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc', cap=3
+)
+partial_error = http.client.HTTPResponse(partial_error_socket)
+partial_error.begin()
+try:
+    partial_error.read()
+except socket.error:
+    pass
+else:
+    raise AssertionError('partial transport error was treated as EOF')
+
+print('SOCKET_IO_BUFFERING_OK')
+"#
+            .to_string(),),
+        )
+        .await?;
+    execute.post_return_async(&mut store).await?;
+
+    match &result {
+        Ok(output) => {
+            assert_eq!(
+                output.stdout.trim(),
+                "SOCKET_IO_BUFFERING_OK",
+                "SocketIO short-read regression: {output:?}"
+            );
+        }
+        Err(error) => panic!("SocketIO short-read probe failed: {error}"),
+    }
+
+    Ok(())
+}
+
 /// TCP error type for test stubs.
 #[derive(
     wasmtime::component::ComponentType, wasmtime::component::Lift, wasmtime::component::Lower, Clone,
