@@ -74,8 +74,8 @@ pub use pyo3::ffi::{
     PyObject,
     // Object protocol
     PyObject_Call,
+    PyObject_CallFunctionObjArgs,
     PyObject_CallNoArgs,
-    PyObject_CallOneArg,
     PyObject_GetAttrString,
     PyObject_Repr,
     PyObject_SetAttrString,
@@ -3177,8 +3177,11 @@ pub fn execute_python_cli(
                 cwd.as_ptr().cast(),
                 cwd.len() as isize,
             ))?;
-            let _changed_directory =
-                OwnedPythonObject::new(PyObject_CallOneArg(chdir.0, directory.0))?;
+            let _changed_directory = OwnedPythonObject::new(PyObject_CallFunctionObjArgs(
+                chdir.0,
+                directory.0,
+                std::ptr::null_mut::<PyObject>(),
+            ))?;
             if PyObject_SetAttrString(sys.0, c"argv".as_ptr(), arguments.0) != 0 {
                 let error = get_last_error_message();
                 restore_cli_context(
@@ -3254,7 +3257,7 @@ unsafe fn restore_cli_context(
         let contents = count >= 0 && PyList_SetSlice(path, 0, count, items) == 0;
         let path_restored = PyObject_SetAttrString(sys, c"path".as_ptr(), path) == 0;
         let argv_restored = PyObject_SetAttrString(sys, c"argv".as_ptr(), argv) == 0;
-        let directory = PyObject_CallOneArg(chdir, cwd);
+        let directory = PyObject_CallFunctionObjArgs(chdir, cwd, std::ptr::null_mut::<PyObject>());
         let directory_restored = !directory.is_null();
         if directory_restored {
             Py_DecRef(directory);
