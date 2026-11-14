@@ -54,8 +54,12 @@ The command export supports `python -c CODE ARGS...`, `python FILE ARGS...`,
 `python -m MODULE ARGS...`, and piped input through bare `python` or
 `python - ARGS...`. Arguments are passed as Unicode data in `sys.argv`, including
 empty arguments and arguments with spaces. Module execution uses `runpy` with
-the located module filename in `sys.argv[0]`. The separate `execute(code)` export
-retains its library context after a command completes or fails.
+the located module filename in `sys.argv[0]`. Commands prepend their script or
+working directory to a copy of the configured search path. The original
+`sys.argv` and `sys.path` are restored after success or failure, preserving the
+separate `execute(code)` export's argument and import context. Failed commands
+retain captured stdout and stderr; the WASI command result distinguishes success
+from failure rather than carrying a numeric process exit status.
 
 ## Run host probe
 

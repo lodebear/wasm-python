@@ -59,7 +59,11 @@ pub use pyo3::ffi::{
     PyImport_ImportModule,
     // List operations
     PyList_Append,
+    PyList_GetSlice,
+    PyList_Insert,
     PyList_New,
+    PyList_SetSlice,
+    PyList_Size,
     // Long (int) operations
     PyLong_AsLong,
     PyLong_FromLong,
@@ -3125,55 +3129,95 @@ pub fn execute_python(code: &str) -> ExecuteResult {
 /// Set command arguments as Unicode data only for a command-style invocation.
 /// Restore the prior object so later execute(code) calls retain their library
 /// context, including after an exception or a captured SystemExit.
-pub fn execute_python_cli(code: &str, filename: Option<&str>, argv: &[String]) -> ExecuteResult {
+pub fn execute_python_cli(
+    code: &str,
+    filename: Option<&str>,
+    argv: &[String],
+    path0: &str,
+) -> ExecuteResult {
     if !is_python_initialized() {
         return ExecuteResult::Error("Python not initialized".to_string());
     }
     unsafe {
-        let sys = PyImport_ImportModule(c"sys".as_ptr());
-        if sys.is_null() {
-            return ExecuteResult::Error(get_last_error_message());
-        }
-        let prior = PyObject_GetAttrString(sys, c"argv".as_ptr());
-        if prior.is_null() {
-            Py_DecRef(sys);
-            return ExecuteResult::Error(get_last_error_message());
-        }
-        let arguments = PyList_New(0);
-        if arguments.is_null() {
-            Py_DecRef(prior);
-            Py_DecRef(sys);
-            return ExecuteResult::Error(get_last_error_message());
-        }
-        for arg in argv {
-            let value = PyUnicode_FromStringAndSize(arg.as_ptr().cast(), arg.len() as isize);
-            let failed = value.is_null() || PyList_Append(arguments, value) != 0;
-            if !value.is_null() {
-                Py_DecRef(value);
+        let run = || -> Result<ExecuteResult, String> {
+            let sys = OwnedPythonObject::new(PyImport_ImportModule(c"sys".as_ptr()))?;
+            let prior = OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"argv".as_ptr()))?;
+            let prior_path =
+                OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"path".as_ptr()))?;
+            let count = PyList_Size(prior_path.0);
+            if count < 0 {
+                return Err(get_last_error_message());
             }
-            if failed {
-                Py_DecRef(arguments);
-                Py_DecRef(prior);
-                Py_DecRef(sys);
-                return ExecuteResult::Error(get_last_error_message());
+            let path_snapshot = OwnedPythonObject::new(PyList_GetSlice(prior_path.0, 0, count))?;
+            let command_path = OwnedPythonObject::new(PyList_GetSlice(prior_path.0, 0, count))?;
+            let first_path = OwnedPythonObject::new(PyUnicode_FromStringAndSize(
+                path0.as_ptr().cast(),
+                path0.len() as isize,
+            ))?;
+            if PyList_Insert(command_path.0, 0, first_path.0) != 0 {
+                return Err(get_last_error_message());
             }
-        }
-        let installed = PyObject_SetAttrString(sys, c"argv".as_ptr(), arguments) == 0;
-        Py_DecRef(arguments);
-        if !installed {
-            Py_DecRef(prior);
-            Py_DecRef(sys);
-            return ExecuteResult::Error(get_last_error_message());
-        }
+            let arguments = OwnedPythonObject::new(PyList_New(0))?;
+            for arg in argv {
+                let value = OwnedPythonObject::new(PyUnicode_FromStringAndSize(
+                    arg.as_ptr().cast(),
+                    arg.len() as isize,
+                ))?;
+                if PyList_Append(arguments.0, value.0) != 0 {
+                    return Err(get_last_error_message());
+                }
+            }
+            if PyObject_SetAttrString(sys.0, c"argv".as_ptr(), arguments.0) != 0 {
+                return Err(get_last_error_message());
+            }
+            if PyObject_SetAttrString(sys.0, c"path".as_ptr(), command_path.0) != 0 {
+                let error = get_last_error_message();
+                restore_cli_context(sys.0, prior.0, prior_path.0, path_snapshot.0);
+                return Err(error);
+            }
+            let result =
+                execute_python_with_filename_impl(code, filename.unwrap_or("<user>"), true);
+            if !restore_cli_context(sys.0, prior.0, prior_path.0, path_snapshot.0) {
+                return Err(get_last_error_message());
+            }
+            Ok(result)
+        };
+        run().unwrap_or_else(ExecuteResult::Error)
+    }
+}
 
-        let result = execute_python_with_filename(code, filename.unwrap_or("<user>"));
-        let restored = PyObject_SetAttrString(sys, c"argv".as_ptr(), prior) == 0;
-        Py_DecRef(prior);
-        Py_DecRef(sys);
-        if !restored {
-            return ExecuteResult::Error(get_last_error_message());
+struct OwnedPythonObject(*mut PyObject);
+
+impl OwnedPythonObject {
+    fn new(value: *mut PyObject) -> Result<Self, String> {
+        if value.is_null() {
+            Err(unsafe { get_last_error_message() })
+        } else {
+            Ok(Self(value))
         }
-        result
+    }
+}
+
+impl Drop for OwnedPythonObject {
+    fn drop(&mut self) {
+        unsafe {
+            Py_DecRef(self.0);
+        }
+    }
+}
+
+unsafe fn restore_cli_context(
+    sys: *mut PyObject,
+    argv: *mut PyObject,
+    path: *mut PyObject,
+    items: *mut PyObject,
+) -> bool {
+    unsafe {
+        let count = PyList_Size(path);
+        let contents = count >= 0 && PyList_SetSlice(path, 0, count, items) == 0;
+        let path_restored = PyObject_SetAttrString(sys, c"path".as_ptr(), path) == 0;
+        let argv_restored = PyObject_SetAttrString(sys, c"argv".as_ptr(), argv) == 0;
+        contents && path_restored && argv_restored
     }
 }
 
@@ -3182,6 +3226,21 @@ pub fn execute_python_cli(code: &str, filename: Option<&str>, argv: &[String]) -
 /// `filename` is used for compile-time metadata and for the Python
 /// `__file__` variable when `_mcpone_exec` runs.
 pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult {
+    execute_python_with_filename_impl(code, filename, false)
+}
+
+fn emit_cli_stdout(stdout: &str) {
+    use std::io::Write;
+    let mut output = std::io::stdout();
+    let _ = output.write_all(stdout.as_bytes());
+    let _ = output.flush();
+}
+
+fn execute_python_with_filename_impl(
+    code: &str,
+    filename: &str,
+    emit_cli_failure_stdout: bool,
+) -> ExecuteResult {
     use std::ffi::CString;
 
     if !is_python_initialized() {
@@ -3197,6 +3256,29 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
     }
 
     unsafe {
+        // Keep native stream objects outside the Python bootstrap namespace.
+        // User code can replace its capture helper; failure must not reuse a
+        // prior execution's output or leave redirected streams installed.
+        let streams = (|| -> Result<_, String> {
+            let sys = OwnedPythonObject::new(PyImport_ImportModule(c"sys".as_ptr()))?;
+            let stdout = OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"stdout".as_ptr()))?;
+            let stderr = OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"stderr".as_ptr()))?;
+            Ok((sys, stdout, stderr))
+        })();
+        let (stream_sys, original_stdout, original_stderr) = match streams {
+            Ok(streams) => streams,
+            Err(error) => return ExecuteResult::Error(error),
+        };
+        let take_output = || {
+            let status = PyRun_SimpleString(c"_mcpone_output = ''\n_mcpone_errors = ''\n_mcpone_output, _mcpone_errors = _mcpone_get_output()".as_ptr());
+            if status != 0 {
+                let _ = PyObject_SetAttrString(stream_sys.0, c"stdout".as_ptr(), original_stdout.0);
+                let _ = PyObject_SetAttrString(stream_sys.0, c"stderr".as_ptr(), original_stderr.0);
+                PyErr_Clear();
+            }
+            status == 0
+        };
+
         // Call the pre-compiled _mcpone_exec() function with the user code.
         // This is MUCH faster than the old approach because:
         // 1. All infrastructure (imports, trace func, etc.) is already set up
@@ -3216,10 +3298,13 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
 
         if exec_result != 0 {
             // Execution failed - get error and output
-            let _ = PyRun_SimpleString(
-                c"_mcpone_output, _mcpone_errors = _mcpone_get_output()".as_ptr(),
-            );
+            if !take_output() {
+                return ExecuteResult::Error("Python output capture failed".to_string());
+            }
 
+            if emit_cli_failure_stdout {
+                emit_cli_stdout(&get_python_variable_string("_mcpone_output").unwrap_or_default());
+            }
             let stderr_output = get_python_variable_string("_mcpone_errors").unwrap_or_default();
             let exception_msg = get_last_error_message();
 
@@ -3244,12 +3329,12 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
         }
 
         // Execution complete - get output and restore streams
-        let _ =
-            PyRun_SimpleString(c"_mcpone_output, _mcpone_errors = _mcpone_get_output()".as_ptr());
+        if !take_output() {
+            return ExecuteResult::Error("Python output capture failed".to_string());
+        }
 
         let stdout = get_python_variable_string("_mcpone_output").unwrap_or_default();
         let stderr = get_python_variable_string("_mcpone_errors").unwrap_or_default();
-        let stdout = stdout.trim_end_matches('\n').to_string();
         let stderr = stderr.trim_end_matches('\n').to_string();
 
         // _mcpone_exec catches SystemExit to prevent PyRun_SimpleString from
@@ -3267,6 +3352,9 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
             .unwrap_or(0);
 
         if system_exit_code != 0 {
+            if emit_cli_failure_stdout {
+                emit_cli_stdout(&stdout);
+            }
             let error = if stderr.is_empty() {
                 format!("SystemExit: {system_exit_code}")
             } else {
@@ -3275,7 +3363,10 @@ pub fn execute_python_with_filename(code: &str, filename: &str) -> ExecuteResult
             return ExecuteResult::Error(error);
         }
 
-        ExecuteResult::Complete(ExecuteOutput { stdout, stderr })
+        ExecuteResult::Complete(ExecuteOutput {
+            stdout: stdout.trim_end_matches('\n').to_string(),
+            stderr,
+        })
     }
 }
 

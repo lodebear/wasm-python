@@ -7,6 +7,7 @@ pub(crate) struct CliRunInput {
     pub code: String,
     pub filename: Option<String>,
     pub argv: Vec<String>,
+    pub path0: String,
 }
 
 impl CliRunInput {
@@ -19,6 +20,7 @@ impl CliRunInput {
                 Ok(Self {
                     code: code.clone(),
                     filename: None,
+                    path0: String::new(),
                     argv: std::iter::once("-c".to_string())
                         .chain(argv[3..].iter().cloned())
                         .collect(),
@@ -36,6 +38,10 @@ impl CliRunInput {
                         python_string_literal(module)
                     ),
                     filename: Some(format!("<module {module}>")),
+                    path0: std::env::current_dir()
+                        .map_err(|err| err.to_string())?
+                        .to_string_lossy()
+                        .into_owned(),
                     argv: std::iter::once("-m".to_string())
                         .chain(argv[3..].iter().cloned())
                         .collect(),
@@ -46,6 +52,13 @@ impl CliRunInput {
                     .map_err(|err| format!("Failed to read python script '{file}': {err}"))?,
                 filename: Some(file.to_string()),
                 argv: argv[1..].to_vec(),
+                path0: std::env::current_dir()
+                    .map_err(|err| err.to_string())?
+                    .join(file)
+                    .parent()
+                    .ok_or("script has no parent directory")?
+                    .to_string_lossy()
+                    .into_owned(),
             }),
             None | Some("-") if !argv.is_empty() => {
                 let mut code = String::new();
@@ -60,6 +73,7 @@ impl CliRunInput {
                 Ok(Self {
                     code,
                     filename: Some("<stdin>".to_string()),
+                    path0: String::new(),
                     argv: if argv.len() == 1 {
                         vec![String::new()]
                     } else {
@@ -109,6 +123,7 @@ mod tests {
         assert_eq!(input.code, code);
         assert_eq!(input.argv, args(&["-c", "", "a b", "'\\\n\r\t\0", "雪"]));
         assert_eq!(input.filename, None);
+        assert_eq!(input.path0, "");
     }
 
     #[test]
@@ -120,6 +135,7 @@ mod tests {
         .unwrap();
         assert_eq!(input.filename.as_deref(), Some(file!()));
         assert_eq!(input.code, std::fs::read_to_string(file!()).unwrap());
+        assert!(std::path::Path::new(&input.path0).is_absolute());
         assert_eq!(
             input.argv,
             args(&[file!(), "ens", "--domain", "example.eth"])
@@ -136,6 +152,8 @@ mod tests {
         assert_eq!(marked.argv, args(&["-", "", "a b"]));
         assert_eq!(marked.filename.as_deref(), Some("<stdin>"));
         assert_eq!(marked.code, "print('stdin')");
+        assert_eq!(bare.path0, "");
+        assert_eq!(marked.path0, "");
     }
 
     #[test]
@@ -146,6 +164,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(input.argv, args(&["-m", "--sort-keys", "a b.json"]));
+        assert_eq!(
+            input.path0,
+            std::env::current_dir().unwrap().to_string_lossy()
+        );
         assert!(
             input
                 .code

@@ -2346,7 +2346,12 @@ fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
     };
 
     let result = with_wit(wit, || {
-        python::execute_python_cli(&input.code, input.filename.as_deref(), &input.argv)
+        python::execute_python_cli(
+            &input.code,
+            input.filename.as_deref(),
+            &input.argv,
+            &input.path0,
+        )
     });
     match result {
         python::ExecuteResult::Complete(output) => {
