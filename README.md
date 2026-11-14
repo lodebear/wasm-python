@@ -22,10 +22,9 @@ This workspace builds a **custom Python runtime component** (Option B):
 - nightly target `wasm32-wasip1`
 - WASI SDK (clang + wasi-sysroot)
 
-Install WASI SDK (macOS arm64 helper):
+Run these commands from the repository root. Install WASI SDK (macOS arm64 helper):
 
 ```bash
-# Run from the repository root:
 ./scripts/install-wasi-sdk.sh
 export WASI_SDK_PATH=$(find "$PWD/.wasi-sdk" -maxdepth 1 -type d -name 'wasi-sdk-*' | head -n1)
 ```
@@ -33,7 +32,6 @@ export WASI_SDK_PATH=$(find "$PWD/.wasi-sdk" -maxdepth 1 -type d -name 'wasi-sdk
 ## Build runtime.wasm
 
 ```bash
-# Run from the repository root:
 BUILD_MCPONE_PY_RUNTIME=1 cargo build -p mcpone-python-runtime --release
 ```
 
@@ -41,13 +39,19 @@ Expected output:
 
 - `crates/mcpone-python-runtime/runtime.wasm`
 
+The command export supports `python -c CODE ARGS...`, `python FILE ARGS...`,
+`python -m MODULE ARGS...`, and piped input through bare `python` or
+`python - ARGS...`. Arguments are passed as Unicode data in `sys.argv`, including
+empty arguments and arguments with spaces. Module execution uses `runpy` with
+the located module filename in `sys.argv[0]`. The separate `execute(code)` export
+retains its library context after a command completes or fails.
+
 ## Run host probe
 
 ### Rust host probe
 
 ```bash
-# Run from the repository root:
-export PYTHON_STDLIB="$PWD/crates/mcpone-python-wasm-runtime/tests/python-stdlib"
+export PYTHON_STDLIB=/path/to/python-stdlib
 cargo run -p python-host-probe --release
 ```
 

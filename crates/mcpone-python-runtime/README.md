@@ -15,7 +15,7 @@ to produce:
 ## Build
 
 ```bash
-# Run from the repository root:
+# From the repository root:
 BUILD_MCPONE_PY_RUNTIME=1 cargo build -p mcpone-python-runtime --release
 ```
 

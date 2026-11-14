@@ -24,6 +24,7 @@
 #![allow(clippy::unwrap_used)]
 #![allow(clippy::expect_used)]
 
+mod cli;
 pub mod python;
 
 use std::alloc::Layout;
@@ -2333,61 +2334,9 @@ enum HandleExportResult {
     Pending(u32),
 }
 
-fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, String> {
-    if argv.len() == 2 && argv[1] == "-c" {
-        return Err("python wasi:cli/run requires a code string after -c".to_string());
-    }
-
-    if argv.len() >= 3 && argv[1] == "-c" {
-        return Ok(CliRunInput {
-            code: argv[2].clone(),
-            filename: None,
-        });
-    }
-
-    if argv.len() >= 2 && !argv[1].starts_with('-') {
-        let path = argv[1].clone();
-        let code = std::fs::read_to_string(&path)
-            .map_err(|err| format!("Failed to read python script '{path}': {err}"))?;
-
-        return Ok(CliRunInput {
-            code,
-            filename: Some(path),
-        });
-    }
-
-    // No -c and no script file: read code from stdin.
-    // Handles both bare `python` and `python -` (explicit stdin marker, used
-    // by shells with heredocs like `python - <<'PY' ... PY`).
-    if argv.len() == 1 || (argv.len() >= 2 && argv[1] == "-") {
-        use std::io::Read;
-        let mut code = String::new();
-        std::io::stdin()
-            .read_to_string(&mut code)
-            .map_err(|err| format!("Failed to read Python code from stdin: {err}"))?;
-        if code.trim().is_empty() {
-            return Err("no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string());
-        }
-        return Ok(CliRunInput {
-            code,
-            filename: Some("<stdin>".to_string()),
-        });
-    }
-
-    Err("python wasi:cli/run currently supports `-c <code>`, `python <script.py>`, or piped stdin".to_string())
-}
-
-#[derive(Debug, Clone)]
-struct CliRunInput {
-    /// Python source code to execute.
-    code: String,
-    /// Optional filename for compile metadata and `__file__`.
-    filename: Option<String>,
-}
-
 fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
     let argv: Vec<String> = std::env::args().collect();
-    let input = match extract_code_from_python_cli_args(&argv) {
+    let input = match cli::CliRunInput::from_args(&argv, std::io::stdin()) {
         Ok(input) => input,
         Err(message) => {
             eprintln!("{}", message);
@@ -2396,10 +2345,8 @@ fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
         }
     };
 
-    // Delegate to the same execution path used by the execute export.
-    let result = with_wit(wit, || match input.filename.as_deref() {
-        Some(filename) => python::execute_python_with_filename(&input.code, filename),
-        None => python::execute_python(&input.code),
+    let result = with_wit(wit, || {
+        python::execute_python_cli(&input.code, input.filename.as_deref(), &input.argv)
     });
     match result {
         python::ExecuteResult::Complete(output) => {

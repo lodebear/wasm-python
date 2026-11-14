@@ -3122,6 +3122,61 @@ pub fn execute_python(code: &str) -> ExecuteResult {
     execute_python_with_filename(code, "<user>")
 }
 
+/// Set command arguments as Unicode data only for a command-style invocation.
+/// Restore the prior object so later execute(code) calls retain their library
+/// context, including after an exception or a captured SystemExit.
+pub fn execute_python_cli(code: &str, filename: Option<&str>, argv: &[String]) -> ExecuteResult {
+    if !is_python_initialized() {
+        return ExecuteResult::Error("Python not initialized".to_string());
+    }
+    unsafe {
+        let sys = PyImport_ImportModule(c"sys".as_ptr());
+        if sys.is_null() {
+            return ExecuteResult::Error(get_last_error_message());
+        }
+        let prior = PyObject_GetAttrString(sys, c"argv".as_ptr());
+        if prior.is_null() {
+            Py_DecRef(sys);
+            return ExecuteResult::Error(get_last_error_message());
+        }
+        let arguments = PyList_New(0);
+        if arguments.is_null() {
+            Py_DecRef(prior);
+            Py_DecRef(sys);
+            return ExecuteResult::Error(get_last_error_message());
+        }
+        for arg in argv {
+            let value = PyUnicode_FromStringAndSize(arg.as_ptr().cast(), arg.len() as isize);
+            let failed = value.is_null() || PyList_Append(arguments, value) != 0;
+            if !value.is_null() {
+                Py_DecRef(value);
+            }
+            if failed {
+                Py_DecRef(arguments);
+                Py_DecRef(prior);
+                Py_DecRef(sys);
+                return ExecuteResult::Error(get_last_error_message());
+            }
+        }
+        let installed = PyObject_SetAttrString(sys, c"argv".as_ptr(), arguments) == 0;
+        Py_DecRef(arguments);
+        if !installed {
+            Py_DecRef(prior);
+            Py_DecRef(sys);
+            return ExecuteResult::Error(get_last_error_message());
+        }
+
+        let result = execute_python_with_filename(code, filename.unwrap_or("<user>"));
+        let restored = PyObject_SetAttrString(sys, c"argv".as_ptr(), prior) == 0;
+        Py_DecRef(prior);
+        Py_DecRef(sys);
+        if !restored {
+            return ExecuteResult::Error(get_last_error_message());
+        }
+        result
+    }
+}
+
 /// Execute Python code and capture stdout using a specific filename.
 ///
 /// `filename` is used for compile-time metadata and for the Python
