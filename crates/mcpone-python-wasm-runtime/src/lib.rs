@@ -2334,9 +2334,37 @@ enum HandleExportResult {
     Pending(u32),
 }
 
+fn command_initial_directory(wit: &Wit) -> Result<String, String> {
+    let function = get_wasi_import(
+        wit,
+        &["wasi:cli/environment@0.2.0"],
+        "initial-cwd",
+        "command initial directory",
+    )?;
+    let mut call = McponeCall::new();
+    function.call_import_sync(&mut call);
+    let directory = if pop_option_discriminant(&mut call, "initial directory")? {
+        pop_string_value(&mut call, "initial directory")?
+    } else {
+        "/".to_string()
+    };
+    if !std::path::Path::new(&directory).is_absolute() {
+        return Err("command initial directory must be absolute".to_string());
+    }
+    Ok(directory)
+}
+
 fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
+    let cwd = match command_initial_directory(&wit) {
+        Ok(cwd) => cwd,
+        Err(error) => {
+            eprintln!("{error}");
+            cx.stack.push(Value::ResultDiscriminant(false));
+            return HandleExportResult::Complete;
+        }
+    };
     let argv: Vec<String> = std::env::args().collect();
-    let input = match cli::CliRunInput::from_args(&argv, std::io::stdin()) {
+    let input = match cli::CliRunInput::from_args(&argv, std::io::stdin(), &cwd) {
         Ok(input) => input,
         Err(message) => {
             eprintln!("{}", message);
@@ -2351,6 +2379,7 @@ fn handle_wasi_cli_run(wit: Wit, cx: &mut McponeCall) -> HandleExportResult {
             input.filename.as_deref(),
             &input.argv,
             &input.path0,
+            &cwd,
         )
     });
     match result {

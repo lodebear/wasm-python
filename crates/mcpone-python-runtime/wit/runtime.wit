@@ -5,6 +5,8 @@ package mcpone:python@0.1.0;
 /// This defines the interface between the host and guest (Python WASM)
 /// for command-style execution.
 world sandbox {
+    import wasi:cli/environment@0.2.0;
+
     /// TLS networking for secure encrypted connections.
     ///
     /// Note: plain TCP has been ported to WASI Preview2 sockets in the guest.
@@ -35,6 +37,8 @@ world sandbox {
     /// Behaviors:
     /// - `python -c <code>`
     /// - `python <script.py>`
+    /// - `python -m <module>`
+    /// - bare `python` or `python -` with piped input
     ///
     /// Both paths delegate to the same runtime used by `execute`.
     export wasi:cli/run@0.2.0;

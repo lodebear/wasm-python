@@ -60,6 +60,9 @@ working directory to a copy of the configured search path. The original
 separate `execute(code)` export's argument and import context. Failed commands
 retain captured stdout and stderr; the WASI command result distinguishes success
 from failure rather than carrying a numeric process exit status.
+The command's initial directory comes from the standard WASI environment
+interface. Relative script paths and module lookup use that directory; Python's
+working directory is scoped to the command and restored afterwards.
 
 ## Run host probe
 

@@ -75,6 +75,7 @@ pub use pyo3::ffi::{
     // Object protocol
     PyObject_Call,
     PyObject_CallNoArgs,
+    PyObject_CallOneArg,
     PyObject_GetAttrString,
     PyObject_Repr,
     PyObject_SetAttrString,
@@ -3134,6 +3135,7 @@ pub fn execute_python_cli(
     filename: Option<&str>,
     argv: &[String],
     path0: &str,
+    cwd: &str,
 ) -> ExecuteResult {
     if !is_python_initialized() {
         return ExecuteResult::Error("Python not initialized".to_string());
@@ -3141,6 +3143,10 @@ pub fn execute_python_cli(
     unsafe {
         let run = || -> Result<ExecuteResult, String> {
             let sys = OwnedPythonObject::new(PyImport_ImportModule(c"sys".as_ptr()))?;
+            let os = OwnedPythonObject::new(PyImport_ImportModule(c"os".as_ptr()))?;
+            let getcwd = OwnedPythonObject::new(PyObject_GetAttrString(os.0, c"getcwd".as_ptr()))?;
+            let chdir = OwnedPythonObject::new(PyObject_GetAttrString(os.0, c"chdir".as_ptr()))?;
+            let prior_cwd = OwnedPythonObject::new(PyObject_CallNoArgs(getcwd.0))?;
             let prior = OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"argv".as_ptr()))?;
             let prior_path =
                 OwnedPythonObject::new(PyObject_GetAttrString(sys.0, c"path".as_ptr()))?;
@@ -3167,17 +3173,46 @@ pub fn execute_python_cli(
                     return Err(get_last_error_message());
                 }
             }
+            let directory = OwnedPythonObject::new(PyUnicode_FromStringAndSize(
+                cwd.as_ptr().cast(),
+                cwd.len() as isize,
+            ))?;
+            let _changed_directory =
+                OwnedPythonObject::new(PyObject_CallOneArg(chdir.0, directory.0))?;
             if PyObject_SetAttrString(sys.0, c"argv".as_ptr(), arguments.0) != 0 {
-                return Err(get_last_error_message());
+                let error = get_last_error_message();
+                restore_cli_context(
+                    sys.0,
+                    prior.0,
+                    prior_path.0,
+                    path_snapshot.0,
+                    chdir.0,
+                    prior_cwd.0,
+                );
+                return Err(error);
             }
             if PyObject_SetAttrString(sys.0, c"path".as_ptr(), command_path.0) != 0 {
                 let error = get_last_error_message();
-                restore_cli_context(sys.0, prior.0, prior_path.0, path_snapshot.0);
+                restore_cli_context(
+                    sys.0,
+                    prior.0,
+                    prior_path.0,
+                    path_snapshot.0,
+                    chdir.0,
+                    prior_cwd.0,
+                );
                 return Err(error);
             }
             let result =
                 execute_python_with_filename_impl(code, filename.unwrap_or("<user>"), true);
-            if !restore_cli_context(sys.0, prior.0, prior_path.0, path_snapshot.0) {
+            if !restore_cli_context(
+                sys.0,
+                prior.0,
+                prior_path.0,
+                path_snapshot.0,
+                chdir.0,
+                prior_cwd.0,
+            ) {
                 return Err(get_last_error_message());
             }
             Ok(result)
@@ -3211,13 +3246,20 @@ unsafe fn restore_cli_context(
     argv: *mut PyObject,
     path: *mut PyObject,
     items: *mut PyObject,
+    chdir: *mut PyObject,
+    cwd: *mut PyObject,
 ) -> bool {
     unsafe {
         let count = PyList_Size(path);
         let contents = count >= 0 && PyList_SetSlice(path, 0, count, items) == 0;
         let path_restored = PyObject_SetAttrString(sys, c"path".as_ptr(), path) == 0;
         let argv_restored = PyObject_SetAttrString(sys, c"argv".as_ptr(), argv) == 0;
-        contents && path_restored && argv_restored
+        let directory = PyObject_CallOneArg(chdir, cwd);
+        let directory_restored = !directory.is_null();
+        if directory_restored {
+            Py_DecRef(directory);
+        }
+        contents && path_restored && argv_restored && directory_restored
     }
 }
 
