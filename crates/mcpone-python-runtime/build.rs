@@ -49,6 +49,7 @@ fn main() {
     );
     // Rerun if the build flag changes
     println!("cargo::rerun-if-env-changed=BUILD_MCPONE_PY_RUNTIME");
+    println!("cargo::rerun-if-env-changed=MCPONE_PY_RUNTIME_ENCODED_RUSTFLAGS");
     // Rerun if pre-built artifacts change
     println!(
         "cargo::rerun-if-changed={}",
@@ -148,7 +149,14 @@ fn build_wasm_runtime(wasm_runtime_dir: &PathBuf) -> PathBuf {
 
     // Set the env vars we need
     // IMPORTANT: Use separate target dir to avoid cargo lock contention
-    cmd.env("RUSTFLAGS", "-C relocation-model=pic");
+    // Host flags can be invalid for WASI. Forward only explicitly selected
+    // guest flags, using Cargo's unit-separator encoding so spaces survive.
+    let mut guest_flags = env::var("MCPONE_PY_RUNTIME_ENCODED_RUSTFLAGS").unwrap_or_default();
+    if !guest_flags.is_empty() {
+        guest_flags.push('\u{1f}');
+    }
+    guest_flags.push_str("-C\u{1f}relocation-model=pic");
+    cmd.env("CARGO_ENCODED_RUSTFLAGS", guest_flags);
     cmd.env("CARGO_TARGET_DIR", &nested_target_dir);
 
     let status = cmd

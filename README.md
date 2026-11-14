@@ -35,6 +35,17 @@ export WASI_SDK_PATH=$(find "$PWD/.wasi-sdk" -maxdepth 1 -type d -name 'wasi-sdk
 BUILD_MCPONE_PY_RUNTIME=1 cargo build -p mcpone-python-runtime --release
 ```
 
+The nested WASI build isolates host Rust/Cargo flags. To supply guest compiler
+flags explicitly, use `MCPONE_PY_RUNTIME_ENCODED_RUSTFLAGS`. Multiple flags use
+the same unit-separator encoding as Cargo's `CARGO_ENCODED_RUSTFLAGS`; the build
+always adds position-independent code. For example, a release build can remap
+machine-specific source paths without adding them to project configuration:
+
+```sh
+MCPONE_PY_RUNTIME_ENCODED_RUSTFLAGS="--remap-path-prefix=$HOME=/build" \
+  BUILD_MCPONE_PY_RUNTIME=1 cargo build -p mcpone-python-runtime --release
+```
+
 Expected output:
 
 - `crates/mcpone-python-runtime/runtime.wasm`
