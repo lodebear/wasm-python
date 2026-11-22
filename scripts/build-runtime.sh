@@ -29,7 +29,7 @@ if [[ -z "${WASI_SDK_PATH:-}" ]]; then
   for cand in \
     "$ROOT/.wasi-sdk"/wasi-sdk-*-arm64-macos \
     "$ROOT/.wasi-sdk"/wasi-sdk-*-x86_64-linux \
-    $ROOT/.wasi-sdk/wasi-sdk-27.0-arm64-macos
+    "$ROOT/.wasi-sdk/wasi-sdk-27.0-arm64-macos"
   do
     if [[ -x "$cand/bin/clang" ]]; then
       export WASI_SDK_PATH="$cand"

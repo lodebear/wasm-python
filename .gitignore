@@ -41,3 +41,10 @@ threads-stage3/*.wasm
 # scripts/prepare-threaded-python-assets.sh; the bridge .zst is committed and
 # the stdlib is reproduced from the (gitignored) Stage-2 build tree.
 threads-stage3/assets/
+
+# Generated runtime and local working copies
+/.worktrees/
+/crates/mcpone-python-runtime/runtime.wasm
+/crates/mcpone-python-runtime/prebuilt/
+/crates/mcpone-python-wasm-runtime/tests/python-vendor-site-packages/
+/threads-artifacts/*.zst
