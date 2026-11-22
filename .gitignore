@@ -21,3 +21,10 @@ crates/mcpone-python-wasm-runtime/tests/site-packages/
 
 # OS cruft
 **/.DS_Store
+
+# Generated runtime and local working copies
+/.worktrees/
+/crates/mcpone-python-runtime/runtime.wasm
+/crates/mcpone-python-runtime/prebuilt/
+/crates/mcpone-python-wasm-runtime/tests/python-vendor-site-packages/
+/threads-artifacts/*.zst

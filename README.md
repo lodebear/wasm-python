@@ -56,3 +56,13 @@ Optional env vars:
 - `PY_RUNTIME_COMPONENT=/path/to/runtime.wasm`
 - `PYTHON_STDLIB=/path/to/python-stdlib`
 - first CLI arg = Python source to execute
+
+## Generated artifacts
+
+Build `runtime.wasm` locally with `BUILD_MCPONE_PY_RUNTIME=1` as shown above.
+The runtime component and generated late-linking libraries are not tracked.
+The base CPython/WASI libraries in `crates/mcpone-python-runtime/libs/` are
+retained as build inputs.
+
+The experimental threaded-runtime branch also builds its runtime and static
+archive locally; see `RUNTIME-BUILD.md` and the scripts on that branch.
