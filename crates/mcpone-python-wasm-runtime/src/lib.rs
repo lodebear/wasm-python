@@ -2333,6 +2333,32 @@ enum HandleExportResult {
     Pending(u32),
 }
 
+fn python_string_literal(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\'' => out.push_str("\\'"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+fn python_list_literal(values: &[String]) -> String {
+    let items = values
+        .iter()
+        .map(|value| python_string_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{items}]")
+}
+
 fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, String> {
     if argv.len() == 2 && argv[1] == "-c" {
         return Err("python wasi:cli/run requires a code string after -c".to_string());
@@ -2342,6 +2368,24 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         return Ok(CliRunInput {
             code: argv[2].clone(),
             filename: None,
+        });
+    }
+
+    if argv.len() == 2 && argv[1] == "-m" {
+        return Err("python wasi:cli/run requires a module name after -m".to_string());
+    }
+
+    if argv.len() >= 3 && argv[1] == "-m" {
+        let module = argv[2].clone();
+        let argv_literal = python_list_literal(&argv[2..]);
+        let module_literal = python_string_literal(&module);
+        return Ok(CliRunInput {
+            code: format!(
+                "import runpy as _mcpone_runpy, sys as _mcpone_sys\n\
+                 _mcpone_sys.argv = {argv_literal}\n\
+                 _mcpone_runpy.run_module({module_literal}, run_name='__main__', alter_sys=True)"
+            ),
+            filename: Some(format!("<module {module}>")),
         });
     }
 
@@ -2366,7 +2410,9 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
             .read_to_string(&mut code)
             .map_err(|err| format!("Failed to read Python code from stdin: {err}"))?;
         if code.trim().is_empty() {
-            return Err("no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string());
+            return Err(
+                "no input: pass `-c <code>`, a script path, or pipe code to stdin".to_string(),
+            );
         }
         return Ok(CliRunInput {
             code,
@@ -2374,7 +2420,7 @@ fn extract_code_from_python_cli_args(argv: &[String]) -> Result<CliRunInput, Str
         });
     }
 
-    Err("python wasi:cli/run currently supports `-c <code>`, `python <script.py>`, or piped stdin".to_string())
+    Err("python wasi:cli/run currently supports `-c <code>`, `-m <module>`, `python <script.py>`, or piped stdin".to_string())
 }
 
 #[derive(Debug, Clone)]
