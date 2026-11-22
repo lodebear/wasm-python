@@ -231,6 +231,8 @@ async fn setup_execute() -> Result<
     // Create WASI context with preopened directories for Python
     let wasi = WasiCtxBuilder::new()
         .inherit_stdio()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         // Set PYTHONPATH so Python can find stdlib during initialization
         .env("PYTHONPATH", "/python-stdlib:/site-packages")
         // Mount stdlib at /python-stdlib (matches what initialize_python expects)
@@ -441,6 +443,74 @@ async fn setup_execute() -> Result<
         })?;
 
     Ok((store, instance, execute))
+}
+
+#[tokio::test]
+async fn test_default_text_encoding() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut store, _instance, execute) = setup_execute().await?;
+    let code = r#"
+import codecs
+import locale
+import sys
+import tempfile
+from pathlib import Path
+
+assert sys.flags.utf8_mode == 1, sys.flags
+# getencoding() reports libc's locale even in UTF-8 mode; the I/O default must
+# be UTF-8 independently of that locale.
+assert codecs.lookup(locale.getpreferredencoding(False)).name == 'utf-8'
+text = 'café — 日本語 🐍\n'
+with tempfile.TemporaryDirectory(dir='/workspace') as directory:
+    path = Path(directory) / 'text.txt'
+    for change_locale in (False, True):
+        if change_locale:
+            locale.setlocale(locale.LC_CTYPE, 'C')
+        path.write_bytes(text.encode('utf-8'))
+        assert path.read_text() == text
+        with open(path) as source:
+            assert source.read() == text
+        path.write_text(text)
+        assert path.read_bytes() == text.encode('utf-8')
+        with open(path, 'w') as target:
+            target.write(text)
+        assert path.read_bytes() == text.encode('utf-8')
+
+    def read_ascii_open():
+        with open(path, encoding='ascii') as source:
+            return source.read()
+
+    for read in (lambda: path.read_text(encoding='ascii'), read_ascii_open):
+        try:
+            read()
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise AssertionError('explicit ASCII read accepted non-ASCII text')
+    for use_path in (False, True):
+        try:
+            if use_path:
+                path.write_text(text, encoding='ascii')
+            else:
+                with open(path, 'w', encoding='ascii') as target:
+                    target.write(text)
+        except UnicodeEncodeError:
+            pass
+        else:
+            raise AssertionError('explicit ASCII write accepted non-ASCII text')
+    path.write_text('ASCII\n', encoding='ascii')
+    with open(path, encoding='ascii') as source:
+        assert source.read() == 'ASCII\n'
+print('UTF-8 defaults and explicit ASCII passed')
+"#;
+    let (result,) = execute.call_async(&mut store, (code.to_string(),)).await?;
+    execute.post_return_async(&mut store).await?;
+    let output = result.expect("default and explicit encodings should work in the C locale");
+    assert_eq!(
+        output.stdout.trim(),
+        "UTF-8 defaults and explicit ASCII passed"
+    );
+    assert!(output.stderr.is_empty(), "{}", output.stderr);
+    Ok(())
 }
 
 #[tokio::test]
