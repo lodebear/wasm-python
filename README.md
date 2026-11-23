@@ -64,6 +64,29 @@ The command's initial directory comes from the standard WASI environment
 interface. Relative script paths and module lookup use that directory; Python's
 working directory is scoped to the command and restored afterwards.
 
+### Default text encoding
+
+The embedded interpreter enables UTF-8 mode with `PyPreConfig.utf8_mode = 1`
+and `Py_PreInitialize` before `Py_InitializeEx(0)`. Default `open()` and `Path`
+text I/O therefore use UTF-8, including under `LANG=C LC_ALL=C`. An explicit
+`encoding='ascii'` still selects ASCII. `PYTHONPATH` and `PYTHONHOME` continue
+to select the mounted Python resources, and signal handlers remain disabled.
+
+The small initialization FFI declarations match the bundled CPython 3.14
+library; PyO3's selected limited ABI does not expose these configuration types.
+No CPython source patch is needed.
+
+After building, run the runtime integration tests with a matching Python stdlib:
+
+```bash
+MCPONE_PYTHON_STDLIB=/path/to/python-stdlib \
+  cargo test --locked -p mcpone-python-wasm-runtime --test runtime_test test_default_text_encoding
+```
+
+`test_default_text_encoding` checks UTF-8 startup, Unicode reads and writes,
+later C-locale selection, and explicit ASCII behavior in a fresh WASI instance.
+
+
 ## Run host probe
 
 ### Rust host probe

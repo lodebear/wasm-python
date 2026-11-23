@@ -91,8 +91,40 @@ pub use pyo3::ffi::{
     PyUnicode_FromStringAndSize,
 };
 
+// Initialization types are outside PyO3's selected limited ABI. Keep these C
+// layouts aligned with the bundled libpython3.14.so and its initconfig.h:
+// https://github.com/python/cpython/blob/v3.14.0/Include/cpython/initconfig.h
+#[repr(C)]
+struct PyPreConfig {
+    _config_init: std::ffi::c_int,
+    parse_argv: std::ffi::c_int,
+    isolated: std::ffi::c_int,
+    use_environment: std::ffi::c_int,
+    configure_locale: std::ffi::c_int,
+    coerce_c_locale: std::ffi::c_int,
+    coerce_c_locale_warn: std::ffi::c_int,
+    #[cfg(windows)]
+    legacy_windows_fs_encoding: std::ffi::c_int,
+    utf8_mode: std::ffi::c_int,
+    dev_mode: std::ffi::c_int,
+    allocator: std::ffi::c_int,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PyStatus {
+    _type: std::ffi::c_int,
+    func: *const c_char,
+    err_msg: *const c_char,
+    exitcode: std::ffi::c_int,
+}
+
 // Functions not available in pyo3-ffi stable ABI (abi3)
 unsafe extern "C" {
+    fn PyPreConfig_InitPythonConfig(config: *mut PyPreConfig);
+    fn Py_PreInitialize(config: *const PyPreConfig) -> PyStatus;
+    fn PyStatus_Exception(status: PyStatus) -> std::ffi::c_int;
+    fn Py_ExitStatusException(status: PyStatus) -> !;
     pub fn PyRun_SimpleString(command: *const c_char) -> std::ffi::c_int;
     pub fn PyUnicode_AsUTF8(unicode: *mut PyObject) -> *const c_char;
 }
@@ -2848,9 +2880,19 @@ pub fn initialize_python() {
     pyo3::append_to_inittab!(mcpone_module);
 
     unsafe {
-        // Initialize Python without registering signal handlers.
-        // Signal handlers don't make sense in a WASM sandbox.
-        // Note: PYTHONPATH must be set before this call for Python to find stdlib.
+        // Explicit preconfiguration avoids Compat startup's disabled UTF-8 mode.
+        // File APIs still honor an explicit encoding supplied by the caller.
+        let mut preconfig = std::mem::MaybeUninit::<PyPreConfig>::uninit();
+        PyPreConfig_InitPythonConfig(preconfig.as_mut_ptr());
+        let mut preconfig = preconfig.assume_init();
+        preconfig.utf8_mode = 1;
+        let status = Py_PreInitialize(&preconfig);
+        if PyStatus_Exception(status) != 0 {
+            Py_ExitStatusException(status);
+        }
+
+        // Keep environment-based stdlib discovery and omit signal handlers,
+        // which do not make sense in a WASM sandbox.
         Py_InitializeEx(0);
 
         // Ensure __main__ module exists for code execution.
